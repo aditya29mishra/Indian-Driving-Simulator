@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -119,6 +119,12 @@ public class CarMove : MonoBehaviour
         var revsRangeMin = ULerp(0f, m_RevRangeBoundary, CurveFactor(gearNumFactor));
         var revsRangeMax = ULerp(m_RevRangeBoundary, 1f, gearNumFactor);
         Revs = ULerp(revsRangeMin, revsRangeMax, m_GearFactor);
+    }
+
+    public void SetTopSpeed(float kph)
+    {
+        m_Topspeed = kph;
+        m_SpeedType = SpeedType.KPH;
     }
 
 

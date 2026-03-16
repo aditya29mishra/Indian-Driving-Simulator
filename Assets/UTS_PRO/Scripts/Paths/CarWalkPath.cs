@@ -1,48 +1,87 @@
 ﻿using UnityEngine;
 using System.Collections.Generic;
-
 public class CarWalkPath : WalkPath
 {
+    [System.Serializable]
+    public class RoadConnection
+    {
+        public CarWalkPath road;
+        public bool enterAtP0;
+    }
+
     [Tooltip("Vehicle Speed / Скорость машины")] public float moveSpeed = 12.0f;
     [Tooltip("Vehicle Deseleration / Торможение машины")] public float speadDecrease = 2.0f;
     [Tooltip("Vehicle Acceleration / Ускорение автомобиля")] public float speadIncrease = 2.0f;
     [Tooltip("Distance to Car / Расстояние до автомобиля")] public float distanceToCar = 10.0f;
     [Tooltip("Distance to traffic lights / Расстояние до светофора")] public float distanceToSemaphore = 10.0f;
-    [HideInInspector] [SerializeField] [Tooltip("Ignore pedestrian colliders? / Игнорировать коллайдеры пешеходов?")] private bool _ignorePeople = false;
+    [HideInInspector][SerializeField][Tooltip("Ignore pedestrian colliders? / Игнорировать коллайдеры пешеходов?")] private bool _ignorePeople = false;
     [Tooltip("Distance to the point / Расстояние до точки")] public float nextPointThreshold = 3;
     [Tooltip("Maximum rotation angle for braking / Максимальный угол поворота для притормаживания")] public float maxAngleToMoveBreak = 8.0f;
 
+    [Header("Road Connections")]
+    public bool spawnAtP0 = true;
+    public bool spawnAtP1 = false;
+    public List<RoadConnection> p0Connections = new List<RoadConnection>();
+    public List<RoadConnection> p1Connections = new List<RoadConnection>();
+
     private void Start()
     {
-        if(_ignorePeople)
+        if (_ignorePeople)
         {
-            Physics.IgnoreLayerCollision(9, 8, true);  
-        }                 
-    }      
-
-    public override void CreateSpawnPoints()
-    {
-        SpawnPoints = new SpawnPoint[points.GetLength(0)];
-
-        for (int i = 0; i < points.GetLength(0); i++)
-        {
-            var startPoint = _forward[i] ? points[i, 0] : points[i, points.GetLength(1) - 1];
-            var nextPoint = _forward[i] ? points[i, 2] : points[i, points.GetLength(1) - 3];
-
-            SpawnPoints[i] = SpawnPoint.CarCreate(
-                string.Format("SpawnPoint (Path {0})", i + 1),
-                startPoint,
-                nextPoint,
-                lineSpacing,
-                i,
-                _forward[i],
-                this,
-                3f,
-                10f
-            );
+            Physics.IgnoreLayerCollision(9, 8, true);
         }
     }
 
+    public override void CreateSpawnPoints()
+    {
+        if (points == null)
+            DrawCurved(false);
+
+        List<SpawnPoint> spList = new List<SpawnPoint>();
+
+        for (int i = 0; i < points.GetLength(0); i++)
+        {
+            int laneID = GetLaneID(i);
+
+            // Forward lanes (spawn at P0)
+            if (spawnAtP0 && laneID > 0)
+            {
+                var sp = SpawnPoint.CarCreate(
+                    "SpawnPoint_P0",
+                    points[i, 0],
+                    points[i, 2],
+                    lineSpacing,
+                    i,
+                    true,
+                    this,
+                    3f,
+                    10f
+                );
+
+                spList.Add(sp);
+            }
+
+            // Backward lanes (spawn at P1)
+            if (spawnAtP1 && laneID < 0)
+            {
+                var sp = SpawnPoint.CarCreate(
+                    "SpawnPoint_P1",
+                    points[i, pointLength[0] - 1],
+                    points[i, pointLength[0] - 3],
+                    lineSpacing,
+                    i,
+                    false,
+                    this,
+                    3f,
+                    10f
+                );
+
+                spList.Add(sp);
+            }
+        }
+
+        SpawnPoints = spList.ToArray();
+    }
     public override void SpawnOnePeople(int w, bool forward)
     {
         List<GameObject> pfb = new List<GameObject>(walkingPrefabs);
@@ -87,6 +126,10 @@ public class CarWalkPath : WalkPath
         }
 
         movePath._walkPointThreshold = nextPointThreshold;
+        TrafficDebugger.Lane(
+$"Car spawned on lane {w} | Forward {forward}"
+);
+
     }
 
     public override void SpawnPeople()
@@ -264,4 +307,96 @@ public class CarWalkPath : WalkPath
         carAIController.TO_SEMAPHORE = distanceToSemaphore;
         carAIController.MaxAngle = maxAngleToMoveBreak;
     }
+    public int GetLaneID(int laneIndex)
+    {
+        int half = numberOfWays / 2;
+
+        if (laneIndex < half)
+            return half - laneIndex;      // +3 +2 +1
+        else
+            return -(laneIndex - half + 1); // -1 -2 -3
+    }
+    public int GetLaneIndex(int laneID)
+    {
+        int half = numberOfWays / 2;
+
+        if (laneID > 0)
+            return half - laneID;
+        else
+            return half + (-laneID) - 1;
+    }
+    public bool IsForwardLane(int laneIndex)
+    {
+        return GetLaneID(laneIndex) > 0;
+    }
+
+
+#if UNITY_EDITOR
+    void OnDrawGizmos()
+    {
+        if (points == null)
+            DrawCurved(false);
+
+        if (points == null) return;
+
+        int last = points.GetLength(1) - 1;
+
+        for (int w = 0; w < numberOfWays; w++)
+        {
+            Gizmos.color = Color.white;
+
+            for (int i = 0; i < last; i++)
+            {
+                Gizmos.DrawLine(points[w, i], points[w, i + 1]);
+            }
+
+            // P0
+            Gizmos.color = Color.green;
+            Gizmos.DrawSphere(points[w, 0], 0.6f);
+
+            // P1
+            Gizmos.color = Color.red;
+            Gizmos.DrawSphere(points[w, last], 0.6f);
+        }
+
+        // ----- P0 CONNECTIONS -----
+        Gizmos.color = Color.cyan;
+
+        foreach (var c in p0Connections)
+        {
+            if (c == null || c.road == null) continue;
+
+            if (c.road.points == null)
+                c.road.DrawCurved(false);
+
+            if (c.road.points == null) continue;
+
+            Vector3 target = c.enterAtP0
+                ? c.road.points[0, 0]
+                : c.road.points[0, c.road.points.GetLength(1) - 1];
+
+            Gizmos.DrawLine(points[0, 0], target);
+        }
+
+        // ----- P1 CONNECTIONS -----
+        Gizmos.color = Color.yellow;
+
+        foreach (var c in p1Connections)
+        {
+            if (c == null || c.road == null) continue;
+
+            if (c.road.points == null)
+                c.road.DrawCurved(false);
+
+            if (c.road.points == null) continue;
+
+            Vector3 target = c.enterAtP0
+                ? c.road.points[0, 0]
+                : c.road.points[0, c.road.points.GetLength(1) - 1];
+
+            Gizmos.DrawLine(points[0, last], target);
+        }
+    }
+#endif
+
 }

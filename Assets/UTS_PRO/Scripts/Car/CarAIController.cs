@@ -1,6 +1,7 @@
-﻿using UnityEngine;
+using UnityEngine;
+using System.Collections.Generic;
 
-[RequireComponent(typeof (CarMove))]
+[RequireComponent(typeof(CarMove))]
 public class CarAIController : MonoBehaviour
 {
     private Rigidbody rigbody;
@@ -21,12 +22,17 @@ public class CarAIController : MonoBehaviour
     private bool insideSemaphore;
     private bool hasTrailer;
 
-    [SerializeField] [Tooltip("Vehicle Speed / Скорость автомобиля")] private float moveSpeed;
-    [SerializeField] [Tooltip("Acceleration of the car / Ускорение автомобиля")] private float speedIncrease;
-    [SerializeField] [Tooltip("Deceleration of the car / Торможение автомобиля")] private float speedDecrease;
-    [SerializeField] [Tooltip("Distance to the car for braking / Дистанция до автомобиля для торможения")] private float distanceToCar;
-    [SerializeField] [Tooltip("Distance to the traffic light for braking / Дистанция до светофора для торможения")] private float distanceToSemaphore;
-    [SerializeField] [Tooltip("Maximum rotation angle for braking / Максимальный угол поворота для притормаживания")] private float maxAngleToMoveBreak = 8.0f;
+    // Prevents HandleIntersection from firing multiple times while still at junction
+    private bool _intersectionLock;
+    private float _intersectionLockCooldown;
+    private const float IntersectionLockDuration = 0.6f;
+
+    [SerializeField][Tooltip("Vehicle Speed / Скорость автомобиля")] private float moveSpeed;
+    [SerializeField][Tooltip("Acceleration of the car / Ускорение автомобиля")] private float speedIncrease;
+    [SerializeField][Tooltip("Deceleration of the car / Торможение автомобиля")] private float speedDecrease;
+    [SerializeField][Tooltip("Distance to the car for braking / Дистанция до автомобиля для торможения")] private float distanceToCar;
+    [SerializeField][Tooltip("Distance to the traffic light for braking / Дистанция до светофора для торможения")] private float distanceToSemaphore;
+    [SerializeField][Tooltip("Maximum rotation angle for braking / Максимальный угол поворота для притормаживания")] private float maxAngleToMoveBreak = 8.0f;
 
     public float MOVE_SPEED
     {
@@ -54,16 +60,16 @@ public class CarAIController : MonoBehaviour
 
     public float TO_CAR
     {
-        get{return distanceToCar;}
-        set{distanceToCar = value;}
+        get { return distanceToCar; }
+        set { distanceToCar = value; }
     }
 
     public float TO_SEMAPHORE
     {
-        get{return distanceToSemaphore;}
-        set{distanceToSemaphore = value;}
+        get { return distanceToSemaphore; }
+        set { distanceToSemaphore = value; }
     }
-    
+
     public float MaxAngle
     {
         get { return maxAngleToMoveBreak; }
@@ -120,25 +126,45 @@ public class CarAIController : MonoBehaviour
 
         PushRay();
 
-        if(carMove != null && isACar) carMove.Move(curMoveSpeed, 0, 0);
+        if (carMove != null && isACar) carMove.Move(curMoveSpeed, 0, 0);
     }
 
     private void FixedUpdate()
     {
+        if (_intersectionLockCooldown > 0f)
+        {
+            _intersectionLockCooldown -= Time.fixedDeltaTime;
+            if (_intersectionLockCooldown <= 0f)
+                _intersectionLock = false;
+        }
+
         GetPath();
         Drive();
 
-        if(moveBrake)
+        if (moveBrake)
         {
             moveSpeed = startSpeed * 0.5f;
         }
     }
 
+    private static int ClampWaypointIndex(WalkPath path, int lane, int index)
+    {
+        if (path == null) return 0;
+        int total = path.getPointsTotal(lane);
+        if (total <= 0) return 0;
+        return Mathf.Clamp(index, 0, total - 1);
+    }
+
     private void GetPath()
     {
+        if (movePath.walkPath == null) return;
+
         Vector3 targetPos = new Vector3(movePath.finishPos.x, rigbody.transform.position.y, movePath.finishPos.z);
         var richPointDistance = Vector3.Distance(Vector3.ProjectOnPlane(rigbody.transform.position, Vector3.up),
             Vector3.ProjectOnPlane(movePath.finishPos, Vector3.up));
+
+        int w = movePath.w;
+        WalkPath path = movePath.walkPath;
 
         if (richPointDistance < 5.0f && ((movePath.loop) || (!movePath.loop && movePath.targetPoint > 0 && movePath.targetPoint < movePath.targetPointsTotal)))
         {
@@ -146,11 +172,12 @@ public class CarAIController : MonoBehaviour
             {
                 if (movePath.targetPoint < movePath.targetPointsTotal)
                 {
-                    targetPos = movePath.walkPath.getNextPoint(movePath.w, movePath.targetPoint + 1);
+                    int nextIdx = ClampWaypointIndex(path, w, movePath.targetPoint + 1);
+                    targetPos = path.getNextPoint(w, nextIdx);
                 }
                 else
                 {
-                    targetPos = movePath.walkPath.getNextPoint(movePath.w, 0);
+                    targetPos = path.getNextPoint(w, ClampWaypointIndex(path, w, 0));
                 }
 
                 targetPos.y = rigbody.transform.position.y;
@@ -159,11 +186,13 @@ public class CarAIController : MonoBehaviour
             {
                 if (movePath.targetPoint > 0)
                 {
-                    targetPos = movePath.walkPath.getNextPoint(movePath.w, movePath.targetPoint - 1);
+                    int prevIdx = ClampWaypointIndex(path, w, movePath.targetPoint - 1);
+                    targetPos = path.getNextPoint(w, prevIdx);
                 }
                 else
                 {
-                    targetPos = movePath.walkPath.getNextPoint(movePath.w, movePath.targetPointsTotal);
+                    int lastIdx = ClampWaypointIndex(path, w, movePath.targetPointsTotal);
+                    targetPos = path.getNextPoint(w, lastIdx);
                 }
 
                 targetPos.y = rigbody.transform.position.y;
@@ -188,9 +217,9 @@ public class CarAIController : MonoBehaviour
             }
         }
 
-        if(richPointDistance < 10.0f)
+        if (richPointDistance < 10.0f)
         {
-            if(movePath.nextFinishPos != Vector3.zero)
+            if (movePath.nextFinishPos != Vector3.zero)
             {
                 Vector3 targetDirection = movePath.nextFinishPos - transform.position;
                 angleBetweenPoint = (Mathf.Abs(Vector3.SignedAngle(targetDirection, transform.forward, Vector3.up)));
@@ -228,11 +257,17 @@ public class CarAIController : MonoBehaviour
             if (movePath.targetPoint != movePath.targetPointsTotal)
             {
                 movePath.targetPoint++;
-                movePath.finishPos = movePath.walkPath.getNextPoint(movePath.w, movePath.targetPoint);
+                movePath.targetPoint = Mathf.Min(movePath.targetPoint, movePath.targetPointsTotal);
+                int idx = ClampWaypointIndex(path, w, movePath.targetPoint);
+                movePath.finishPos = path.getNextPoint(w, idx);
+                TrafficDebugger.Waypoint(
+                    $"{name} lane {movePath.w} -> waypoint {movePath.targetPoint}"
+                );
 
-                if(movePath.targetPoint != movePath.targetPointsTotal)
+                if (movePath.targetPoint != movePath.targetPointsTotal)
                 {
-                    movePath.nextFinishPos = movePath.walkPath.getNextPoint(movePath.w, movePath.targetPoint + 1);
+                    int nextIdx = ClampWaypointIndex(path, w, movePath.targetPoint + 1);
+                    movePath.nextFinishPos = path.getNextPoint(w, nextIdx);
                 }
             }
             else if (movePath.targetPoint == movePath.targetPointsTotal)
@@ -240,46 +275,149 @@ public class CarAIController : MonoBehaviour
                 if (movePath.loop)
                 {
                     movePath.finishPos = movePath.walkPath.getStartPoint(movePath.w);
-
                     movePath.targetPoint = 0;
                 }
                 else
                 {
-                    movePath.walkPath.SpawnPoints[movePath.w].AddToSpawnQuery(new MovePathParams { });
-                    Destroy(gameObject);
+                    HandleIntersection();
                 }
             }
-
         }
         else if (richPointDistance <= movePath._walkPointThreshold && !movePath.forward)
         {
             if (movePath.targetPoint > 0)
             {
                 movePath.targetPoint--;
+                movePath.finishPos = path.getNextPoint(w, ClampWaypointIndex(path, w, movePath.targetPoint));
 
-                movePath.finishPos = movePath.walkPath.getNextPoint(movePath.w, movePath.targetPoint);
-
-                if(movePath.targetPoint > 0)
+                if (movePath.targetPoint > 0)
                 {
-                    movePath.nextFinishPos = movePath.walkPath.getNextPoint(movePath.w, movePath.targetPoint - 1);
+                    movePath.nextFinishPos = path.getNextPoint(w, ClampWaypointIndex(path, w, movePath.targetPoint - 1));
                 }
             }
             else if (movePath.targetPoint == 0)
             {
                 if (movePath.loop)
                 {
-                    movePath.finishPos = movePath.walkPath.getNextPoint(movePath.w, movePath.targetPointsTotal);
-
+                    int lastIdx = ClampWaypointIndex(path, w, movePath.targetPointsTotal);
+                    movePath.finishPos = path.getNextPoint(w, lastIdx);
                     movePath.targetPoint = movePath.targetPointsTotal;
                 }
                 else
                 {
-                    movePath.walkPath.SpawnPoints[movePath.w].AddToSpawnQuery(new MovePathParams { });
-                    Destroy(gameObject);
+                    HandleIntersection();
                 }
             }
+            TrafficDebugger.Waypoint(
+                $"{name} Lane {movePath.w} -> Next point {movePath.targetPoint}"
+            );
         }
     }
+    void HandleIntersection()
+    {
+        if (_intersectionLock)
+            return;
+
+        CarWalkPath currentRoad = movePath.walkPath as CarWalkPath;
+        if (currentRoad == null)
+        {
+            Destroy(gameObject);
+            return;
+        }
+
+        List<CarWalkPath.RoadConnection> connections =
+            movePath.targetPoint == movePath.targetPointsTotal
+                ? currentRoad.p1Connections
+                : currentRoad.p0Connections;
+
+        if (connections == null || connections.Count == 0)
+        {
+            TrafficDebugger.Intersection($"{name} reached dead-end road");
+            Destroy(gameObject);
+            return;
+        }
+
+        var next = connections[Random.Range(0, connections.Count)];
+        CarWalkPath nextRoad = next.road;
+        if (nextRoad == null)
+        {
+            TrafficDebugger.Intersection($"{name} connection has no road");
+            Destroy(gameObject);
+            return;
+        }
+
+        _intersectionLock = true;
+        _intersectionLockCooldown = IntersectionLockDuration;
+
+        TrafficDebugger.Intersection($"{name} switching road → {nextRoad.name}");
+
+        MovePath mp = GetComponent<MovePath>();
+        mp.walkPath = nextRoad;
+
+        bool forward = next.enterAtP0;
+        int laneID = currentRoad.GetLaneID(movePath.w);
+        int targetLane = nextRoad.GetLaneIndex(laneID);
+        targetLane = Mathf.Clamp(targetLane, 0, nextRoad.numberOfWays - 1);
+
+        // All lanes share same point count; use lane 0 (WalkPath only sets pointLength[0])
+        int totalPoints = nextRoad.getPointsTotal(0);
+        if (totalPoints < 2)
+        {
+            TrafficDebugger.Intersection($"{name} target road has too few points");
+            _intersectionLock = false;
+            Destroy(gameObject);
+            return;
+        }
+
+        // Last valid waypoint index for driving (points 0 and totalPoints-1 are duplicates of 1 and totalPoints-2)
+        int targetPointsTotal = Mathf.Max(0, totalPoints - 2);
+
+        int startPoint;
+        if (forward)
+            startPoint = totalPoints >= 3 ? 1 : 0;
+        else
+            startPoint = Mathf.Min(targetPointsTotal, totalPoints - 2);
+
+        startPoint = Mathf.Clamp(startPoint, 0, totalPoints - 1);
+
+        mp.w = targetLane;
+        mp.forward = forward;
+        mp.loop = nextRoad.loopPath;
+        mp.targetPoint = startPoint;
+        mp.targetPointsTotal = targetPointsTotal;
+
+        int finishIdx = ClampWaypointIndex(nextRoad, targetLane, startPoint);
+        mp.finishPos = nextRoad.getNextPoint(targetLane, finishIdx);
+
+        if (forward)
+        {
+            int nextIdx = ClampWaypointIndex(nextRoad, targetLane, startPoint + 1);
+            mp.nextFinishPos = nextIdx != finishIdx
+                ? nextRoad.getNextPoint(targetLane, nextIdx)
+                : mp.finishPos;
+        }
+        else
+        {
+            int nextIdx = ClampWaypointIndex(nextRoad, targetLane, startPoint - 1);
+            mp.nextFinishPos = nextIdx != finishIdx
+                ? nextRoad.getNextPoint(targetLane, nextIdx)
+                : mp.finishPos;
+        }
+
+        transform.position = mp.finishPos;
+        Vector3 dir = mp.nextFinishPos - mp.finishPos;
+        if (dir.sqrMagnitude > 0.001f)
+            transform.rotation = Quaternion.LookRotation(dir);
+
+        moveBrake = false;
+
+        TrafficDebugger.Lane(
+            $"{name} entered lane {targetLane} on {nextRoad.name} | Forward {forward} | Waypoint {startPoint}/{targetPointsTotal}"
+        );
+    }
+
+
+
 
     private void Drive()
     {
@@ -364,20 +502,20 @@ public class CarAIController : MonoBehaviour
     {
         RaycastHit hit;
 
-        Ray fwdRay = new Ray(fwdVector, transform.forward * 20) ;
+        Ray fwdRay = new Ray(fwdVector, transform.forward * 20);
         Ray LRay = new Ray(LRVector - transform.right, transform.forward * 20);
         Ray RRay = new Ray(LRVector + transform.right, transform.forward * 20);
 
-        if(Physics.Raycast(fwdRay, out hit, 20) || Physics.Raycast(LRay, out hit, 20) || Physics.Raycast(RRay, out hit, 20))
+        if (Physics.Raycast(fwdRay, out hit, 20) || Physics.Raycast(LRay, out hit, 20) || Physics.Raycast(RRay, out hit, 20))
         {
             float distance = Vector3.Distance(fwdVector, hit.point);
 
             if (hit.transform.CompareTag("Car"))
-            {        
+            {
                 GameObject car = (hit.transform.GetComponentInChildren<ParentOfTrailer>()) ? hit.transform.GetComponent<ParentOfTrailer>().PAR : hit.transform.gameObject;
 
-                if(car != null)
-                { 
+                if (car != null)
+                {
                     MovePath MP = car.GetComponent<MovePath>();
 
                     if (MP.w == movePath.w)
@@ -400,7 +538,7 @@ public class CarAIController : MonoBehaviour
             }
             else
             {
-                if(!moveBrake)
+                if (!moveBrake)
                 {
                     moveSpeed = startSpeed;
                 }
@@ -409,7 +547,7 @@ public class CarAIController : MonoBehaviour
         }
         else
         {
-            if(!moveBrake)
+            if (!moveBrake)
             {
                 moveSpeed = startSpeed;
             }

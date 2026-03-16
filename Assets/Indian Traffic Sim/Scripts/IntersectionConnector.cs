@@ -19,22 +19,22 @@ public class IntersectionConnector : MonoBehaviour
         Connect(nodeW, nodeN); // right
         Connect(nodeW, nodeE); // straight
         Connect(nodeW, nodeS); // left
-        Connect(nodeW, nodeW); // u-turn
+        //Connect(nodeW, nodeW); // u-turn
 
         Connect(nodeS, nodeE);
         Connect(nodeS, nodeN);
         Connect(nodeS, nodeW);
-        Connect(nodeS, nodeS);
+        //Connect(nodeS, nodeS);
 
         Connect(nodeE, nodeS);
         Connect(nodeE, nodeW);
         Connect(nodeE, nodeN);
-        Connect(nodeE, nodeE);
+        //Connect(nodeE, nodeE);
 
         Connect(nodeN, nodeW);
         Connect(nodeN, nodeS);
         Connect(nodeN, nodeE);
-        Connect(nodeN, nodeN);
+        //Connect(nodeN, nodeN);
     }
 
     void Connect(TrafficNode fromNode, TrafficNode toNode)
@@ -124,7 +124,7 @@ public class IntersectionConnector : MonoBehaviour
         if (fromNode == nodeN && toNode == nodeW) return true;
 
         // UTURN
-        if (fromNode == toNode) return true;
+        //if (fromNode == toNode) return true;
 
         return false;
     }
@@ -146,6 +146,8 @@ public class IntersectionConnector : MonoBehaviour
         obj.transform.parent = transform;
 
         TrafficPath path = obj.AddComponent<TrafficPath>();
+        path.road = fromLane.road;
+        path.lane = fromLane;
 
         for (int i = 0; i <= resolution; i++)
         {
@@ -164,7 +166,13 @@ public class IntersectionConnector : MonoBehaviour
             path.waypoints.Add(wp.transform);
         }
 
-        fromLane.nextLanes.Add(toLane);
+        TrafficLane.LanePath lanePath = new TrafficLane.LanePath
+        {
+            path = path,
+            targetLane = toLane
+        };
+
+        fromLane.nextPaths.Add(lanePath);
     }
 
     void ClearOld()

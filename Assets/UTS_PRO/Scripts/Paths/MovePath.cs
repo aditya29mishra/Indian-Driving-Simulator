@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 
 public class MovePath : MonoBehaviour
 {
@@ -20,7 +20,9 @@ public class MovePath : MonoBehaviour
 
         var _WalkPath = walkPath;
         w = _w;
-        targetPointsTotal = _WalkPath.getPointsTotal(0) - 2;
+        // All lanes share same point count; use lane 0 to avoid uninitialized pointLength[w]
+        int totalForLane = _WalkPath.getPointsTotal(0);
+        targetPointsTotal = Mathf.Max(0, totalForLane - 2);
 
         loop = _loop;
 
@@ -67,6 +69,10 @@ public class MovePath : MonoBehaviour
                 finishPos = _WalkPath.getNextPoint(w, _i);
             }
         }
+        TrafficDebugger.Lane(
+$"Car {gameObject.name} entered lane {w} | StartPoint {_i} | Direction {(forward ? "Forward" : "Backward")}"
+);
+
 
     }
 

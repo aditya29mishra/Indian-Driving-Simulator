@@ -12,6 +12,12 @@ public class SpawnPoint : MonoBehaviour
     {
         get { return _insideObjectsCount == 0; }
     }
+    public List<WalkPath> nextPaths = new List<WalkPath>();
+    [Header("Traffic Density")]
+    public int targetCars = 3;
+    public float spawnInterval = 2f;
+
+    private float spawnTimer;
 
     private int _insideObjectsCount = 0;
 
@@ -22,17 +28,17 @@ public class SpawnPoint : MonoBehaviour
     private Queue<MovePathParams> _movePathQueue = new Queue<MovePathParams>();
 
     public static SpawnPoint PeopleCreate(
-        string name, Vector3 spawnPoint, Vector3 nextPoint, 
-        float lineSpacing, int pathIndex, bool isForward, WalkPath walkPath, 
+        string name, Vector3 spawnPoint, Vector3 nextPoint,
+        float lineSpacing, int pathIndex, bool isForward, WalkPath walkPath,
         float boxHeight = 3f, float boxLength = 10f
     )
-    {        
+    {
         var go = new GameObject(name);
         go.transform.position = spawnPoint;
-                    
+
         var cl = go.AddComponent<BoxCollider>();
         var spComponent = go.AddComponent<SpawnPoint>();
-        cl.isTrigger = true;               
+        cl.isTrigger = true;
 
         cl.transform.localScale = new Vector3(lineSpacing - 0.05f, boxHeight, boxLength);
         go.transform.LookAt(nextPoint);
@@ -82,13 +88,21 @@ public class SpawnPoint : MonoBehaviour
 
     private void FixedUpdate()
     {
-        if (IsSpawnPointFree && _movePathQueue.Count > 0)
+        spawnTimer += Time.fixedDeltaTime;
+
+        if (spawnTimer < spawnInterval)
+            return;
+
+        spawnTimer = 0f;
+
+        if (_insideObjectsCount < targetCars)
         {
-            MovePathParams movePathParams = _movePathQueue.Dequeue();
-            _walkPath.SpawnOnePeople(
-                _pathIndex, _isForward
-            );
+            TrafficDebugger.Spawn(
+            $"Lane {_pathIndex} spawning car | Forward: {_isForward}"
+        );
+            _walkPath.SpawnOnePeople(_pathIndex, _isForward);
         }
+
     }
 
     private void OnTriggerEnter(Collider other)
