@@ -142,12 +142,15 @@ public class IntersectionConnector : MonoBehaviour
         Vector3 p2 = end - dirEnd * turnRadius;
         Vector3 p3 = end;
 
-        GameObject obj = new GameObject("TurnPath");
+        string fromId = $"{fromLane.name}";
+        string toId = $"{toLane.name}";
+
+        GameObject obj = new GameObject($"Turn_{fromId}_TO_{toId}");
         obj.transform.parent = transform;
 
         TrafficPath path = obj.AddComponent<TrafficPath>();
         path.road = fromLane.road;
-        path.lane = fromLane;
+        path.lane = toLane;
 
         for (int i = 0; i <= resolution; i++)
         {
@@ -159,7 +162,7 @@ public class IntersectionConnector : MonoBehaviour
                 3 * (1 - t) * t * t * p2 +
                 Mathf.Pow(t, 3) * p3;
 
-            GameObject wp = new GameObject("WP_" + i);
+            GameObject wp = new GameObject($"TurnWP_{i}");
             wp.transform.position = point;
             wp.transform.parent = obj.transform;
 
@@ -173,6 +176,8 @@ public class IntersectionConnector : MonoBehaviour
         };
 
         fromLane.nextPaths.Add(lanePath);
+
+        Debug.Log($"[CONNECT] {fromLane.name} → {toLane.name}");
     }
 
     void ClearOld()

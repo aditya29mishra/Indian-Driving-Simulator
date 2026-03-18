@@ -37,9 +37,16 @@ public class TrafficSignal : MonoBehaviour
     // Fast lookup: lane → group index
     private Dictionary<TrafficLane, int> laneToGroup = new Dictionary<TrafficLane, int>();
 
+    void Awake()
+    {
+        // Build lookup in Awake so it's ready before any other script's Start
+        // runs (e.g. VehicleSpawner.Start calls FindSignalForLane which needs
+        // the dictionary populated, and AssignLane reads GetStateForLane).
+        BuildLookup();
+    }
+
     void Start()
     {
-        BuildLookup();
         SetAllRed();
         if (groups.Count > 0)
         {
@@ -111,9 +118,20 @@ public class TrafficSignal : MonoBehaviour
     public SignalState GetStateForLane(TrafficLane lane)
     {
         if (lane == null) return SignalState.Green;
-        if (!laneToGroup.ContainsKey(lane)) return SignalState.Green;
-        return groups[laneToGroup[lane]].state;
+        if (laneToGroup.TryGetValue(lane, out int g)) return groups[g].state;
+
+        // Lane not registered in any group — this is a setup error, not intentional.
+        // Log once so it shows in the console without spamming every frame.
+        if (!missingLaneWarned.Contains(lane))
+        {
+            missingLaneWarned.Add(lane);
+            Debug.LogWarning($"[TrafficSignal] Lane '{lane.name}' is not in any SignalGroup on '{name}'. " +
+                             $"It will always read Green. Check your signal group setup.", this);
+        }
+        return SignalState.Green;
     }
+
+    private readonly HashSet<TrafficLane> missingLaneWarned = new HashSet<TrafficLane>();
 
     // Returns true if the lane's group is currently active (green or yellow)
     public bool IsLaneActive(TrafficLane lane)
@@ -126,10 +144,8 @@ public class TrafficSignal : MonoBehaviour
     public float TimeRemainingForLane(TrafficLane lane)
     {
         if (lane == null) return 0f;
-        if (!laneToGroup.ContainsKey(lane)) return 0f;
-        int g = laneToGroup[lane];
-        if (g == activeGroup) return phaseTimer;
-        return 0f;
+        if (!laneToGroup.TryGetValue(lane, out int g)) return 0f;
+        return g == activeGroup ? phaseTimer : 0f;
     }
 
     // Rebuild lookup at edit time if groups change

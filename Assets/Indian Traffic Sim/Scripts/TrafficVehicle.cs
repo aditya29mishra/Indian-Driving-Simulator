@@ -18,8 +18,36 @@ using UnityEngine;
 // ─────────────────────────────────────────────────────────────────────────────
 
 [RequireComponent(typeof(CarMove))]
+[RequireComponent(typeof(VehicleRecorder))]
 public class TrafficVehicle : MonoBehaviour
 {
+    // ───────────────── STATE SYSTEM ─────────────────
+
+    public enum MotionState
+    {
+        Idle,
+        Cruising,
+        Following,
+        Stopped,
+        Starting,
+        Braking
+    }
+
+    public enum SignalStateEx
+    {
+        None,
+        Approaching,
+        WaitingRed,
+        Released
+    }
+
+    public enum ManeuverState
+    {
+        LaneKeeping,
+        LaneChangeLeft,
+        LaneChangeRight,
+        Turning
+    }
     public enum DriverProfile { Cautious, Normal, Aggressive }
 
     // ── Config struct — filled by VehicleSpawner ──────────────────────────
@@ -35,6 +63,20 @@ public class TrafficVehicle : MonoBehaviour
         public float vehicleLength;     // for gap calculation
         public float stopLineDistance;  // metres before stop line to begin braking
     }
+    // Current states
+    public MotionState CurrentMotionState { get; private set; }
+    public SignalStateEx CurrentSignalState { get; private set; }
+    public ManeuverState CurrentManeuverState { get; private set; }
+
+    // Previous states
+    public MotionState PreviousMotionState { get; private set; }
+    public SignalStateEx PreviousSignalState { get; private set; }
+    public ManeuverState PreviousManeuverState { get; private set; }
+
+    // Flags
+    public bool IsBlocked { get; private set; }
+    public bool IsStuck { get; private set; }
+    public bool IsInQueue { get; private set; }
 
     // ── System references ─────────────────────────────────────────────────
     [HideInInspector] public TrafficSignal currentSignal;
@@ -66,12 +108,12 @@ public class TrafficVehicle : MonoBehaviour
 
     // ── IDM state ─────────────────────────────────────────────────────────
     private float idmAccel = 0f;   // current IDM acceleration output (m/s²)
-    private bool wasStoppedForSignal = false;
 
     // ── Lane change state ─────────────────────────────────────────────────
     private float laneChangeCheckTimer = 0f;
     private float laneChangeCooldown = 0f;
     private bool insideIntersection = false;
+    private ManeuverState pendingManeuverState = ManeuverState.LaneKeeping;
 
     // ── Stuck escape ──────────────────────────────────────────────────────
     private float stuckTimer = 0f;
@@ -96,9 +138,25 @@ public class TrafficVehicle : MonoBehaviour
     public float StopLineDistance => stopLineDistance;
     public float DistanceTravelled => distanceTravelled;
     public TrafficPath CurrentPath => currentPath;
-    public bool IsChangingLane => false;
-    public float LaneChangeProgress => 0f;
+    public bool IsChangingLane => laneChangeCooldown > 0f && !insideIntersection;
+    public float LaneChangeProgress => Mathf.Clamp01(1f - laneChangeCooldown / 5f);
+    TrafficDataRecorder rec;
+    private string vehicleId;
+    public string GetVehicleId() => vehicleId;
+    private List<string> routeHistory = new List<string>(32);
+    private bool inRestartPhase = false;
+    private float restartTimer = 0f;
+    private float restartDuration = 1.2f; // key tuning param 
 
+    // Signal edge detection
+    private TrafficSignal.SignalState prevSignalState = TrafficSignal.SignalState.Green;
+    private TrafficSignal.SignalState currentSignalStateCached = TrafficSignal.SignalState.Green;
+
+    void CacheRecorder()
+    {
+        if (rec == null)
+            rec = FindObjectOfType<TrafficDataRecorder>();
+    }
     // ─────────────────────────────────────────────────────────────────────
     // Initialise
     // ─────────────────────────────────────────────────────────────────────
@@ -107,6 +165,9 @@ public class TrafficVehicle : MonoBehaviour
     {
         carMove = GetComponent<CarMove>();
         rb = GetComponent<Rigidbody>();
+        CacheRecorder();
+        vehicleId = name + "_" + Random.Range(1000, 9999);
+
     }
 
     public void Initialize(VehicleConfig cfg)
@@ -129,7 +190,30 @@ public class TrafficVehicle : MonoBehaviour
     void Start()
     {
         if (maxSpeedKph <= 0f) ApplyDefaultConfig();
-        if (currentLane != null) AssignLane(currentLane);
+        // Only re-assign lane for editor-placed vehicles (currentLane set in inspector).
+        // Spawned vehicles have AssignLane called explicitly by VehicleSpawner before
+        // Start fires — calling it again here would reset distanceTravelled unnecessarily.
+        if (currentLane != null && currentPath == null)
+            AssignLane(currentLane);
+        routeHistory.Clear();
+        routeHistory.Add("START");
+        rec?.LogEvent(vehicleId, "SPAWN", GetPathId(), GetIntersectionId(), "", -1f, GetRouteTrace());
+    }
+    public string GetPathId()
+    {
+        return currentPath ? currentPath.name : "none";
+    }
+
+    public string GetIntersectionId()
+    {
+        return currentLane && currentLane.road != null
+            ? currentLane.road.name
+            : "none";
+    }
+
+    public string GetRouteTrace()
+    {
+        return string.Join(">", routeHistory);
     }
 
     void ApplyDefaultConfig()
@@ -158,11 +242,11 @@ public class TrafficVehicle : MonoBehaviour
     {
         if (isWaitingForLane || currentPath == null || currentPath.waypoints.Count == 0)
         {
-            carMove.Move(0f, -1f, 0f, 0f); // brake while waiting
+            // -1f footbrake → CarMove re-negates to +1f → full brake hold. Intentional.
+            carMove.Move(0f, -1f, 0f, 0f);
             return;
         }
 
-        // Adjacency refresh
         adjacencyTimer += Time.fixedDeltaTime;
         if (adjacencyTimer >= 5f)
         {
@@ -170,62 +254,208 @@ public class TrafficVehicle : MonoBehaviour
             if (laneManager != null) laneManager.RefreshVehicle(this);
         }
 
-        // Update path progress from actual physics position
         UpdateDistanceTravelled();
         insideIntersection = (currentPath != currentLane?.path);
 
-        // AI decisions
-        DetectLeader();
-        UpdateIDM();
+        if (currentSignal != null && currentLane != null)
+        {
+            currentSignalStateCached = currentSignal.GetStateForLane(currentLane);
+        }
+        else
+        {
+            currentSignalStateCached = TrafficSignal.SignalState.Green;
+        }
 
-        // Lane change check
+        // DetectLeader();
+        UpdateStateSystem();
+        UpdateIDM(); // still called
+
+        // ───────── RESTART PHASE TIMER ─────────
+        if (inRestartPhase)
+        {
+            restartTimer -= Time.fixedDeltaTime;
+            if (restartTimer <= 0f)
+            {
+                inRestartPhase = false;
+            }
+        }
+
+        // Lane change (unchanged)
         if (laneChangeCooldown > 0f) laneChangeCooldown -= Time.fixedDeltaTime;
+
         float lcInterval = driverProfile == DriverProfile.Aggressive ? 1.5f
                          : driverProfile == DriverProfile.Cautious ? 6f : 3f;
-        laneChangeCheckTimer += Time.fixedDeltaTime;
-        if (laneChangeCheckTimer >= lcInterval) { laneChangeCheckTimer = 0f; CheckLaneChange(); }
 
-        // Stuck escape
+        laneChangeCheckTimer += Time.fixedDeltaTime;
+        if (laneChangeCheckTimer >= lcInterval)
+        {
+            laneChangeCheckTimer = 0f;
+            CheckLaneChange();
+        }
+
+        // Stuck escape (unchanged)
         float spd = CurrentSpeed;
         if (spd < 0.2f && leaderVehicle != null) stuckTimer += Time.fixedDeltaTime;
         else stuckTimer = 0f;
+
         if (stuckTimer >= stuckThreshold)
         {
             if (!TryLaneChange(leftLane) && !TryLaneChange(rightLane))
             {
                 if (insideIntersection) Despawn();
-                else if (stuckTimer >= stuckThreshold * 2f) idmAccel = Mathf.Max(idmAccel, 0.3f); // nudge
+                else if (stuckTimer >= stuckThreshold * 2f)
+                    idmAccel = Mathf.Max(idmAccel, 0.3f);
             }
             else stuckTimer = 0f;
         }
 
-        // World-space end-of-path check — catches physics overshoot on turn paths
+        // Path end logic
         if (currentPath != null && currentPath.waypoints.Count > 0)
         {
             Vector3 pathEnd = currentPath.waypoints[currentPath.waypoints.Count - 1].position;
             float distToEnd = Vector3.Distance(transform.position, pathEnd);
-            if (distToEnd < 4f || currentPath.TotalLength - distanceTravelled < 5f)
+            bool isTurnPath = currentLane != null && currentPath != currentLane.path;
+
+            float remaining = currentPath.TotalLength - distanceTravelled;
+
+            // Trigger advance when: physically close to end waypoint OR spline distance
+            // exhausted. The distToEnd < 6f threshold (was 4f) covers the gap between
+            // the last spline point and the actual waypoint transform position.
+            bool nearEnd = distToEnd < 6f || remaining < 2f;
+
+            if (isTurnPath && nearEnd)
+            {
                 AdvanceToNextPath();
+            }
+            else if (!isTurnPath && nearEnd)
+            {
+                AdvanceToNextPath();
+            }
         }
 
-        // Drive
+        // ───────── DRIVE OUTPUT (MODIFIED CORE) ─────────
+
         float steer = ComputeSteering();
-        float throttle = Mathf.Clamp01(idmAccel / Mathf.Max(acceleration, 0.1f));
-        float brake = Mathf.Clamp01(-idmAccel / Mathf.Max(braking, 0.1f));
+
+        float throttle;
+        float brake;
+
+        if (inRestartPhase)
+        {
+            float restartBoost = Mathf.Lerp(0.4f, 1f, 1f - (restartTimer / restartDuration));
+            throttle = Mathf.Clamp01(restartBoost);
+            brake = 0f;
+        }
+        else
+        {
+            throttle = Mathf.Clamp01(idmAccel / Mathf.Max(acceleration, 0.1f));
+            brake = Mathf.Clamp01(-idmAccel / Mathf.Max(braking, 0.1f));
+        }
+
+        // Convention: TrafficVehicle passes footbrake as a NEGATIVE value (0..-1).
+        // CarMove.Move re-negates it internally (line: footbrake = -1 * Clamp(footbrake,-1,0)).
+        // So -brake here → +brake inside CarMove. Do NOT pass +brake — it would be clamped to 0.
         carMove.Move(throttle, -brake, 0f, steer);
     }
 
     // ─────────────────────────────────────────────────────────────────────
     // Pure-pursuit steering
     // ─────────────────────────────────────────────────────────────────────
+    void UpdateStateSystem()
+    {
+        // Store previous
+        PreviousMotionState = CurrentMotionState;
+        PreviousSignalState = CurrentSignalState;
+        PreviousManeuverState = CurrentManeuverState;
 
+        float v = CurrentSpeed;
+
+        // ───────── SIGNAL STATE ─────────
+        if (MustStopForSignal())
+        {
+            CurrentSignalState = SignalStateEx.WaitingRed;
+        }
+        else if (inRestartPhase)
+        {
+            CurrentSignalState = SignalStateEx.Released;
+        }
+        else if (currentSignal != null)
+        {
+            CurrentSignalState = SignalStateEx.Approaching;
+        }
+        else
+        {
+            CurrentSignalState = SignalStateEx.None;
+        }
+
+        // ───────── MANEUVER STATE ─────────
+        if (currentPath != null && currentLane != null && currentPath != currentLane.path)
+        {
+            CurrentManeuverState = ManeuverState.Turning;
+            pendingManeuverState = ManeuverState.LaneKeeping;
+        }
+        else if (laneChangeCooldown > 0f)
+        {
+            CurrentManeuverState = pendingManeuverState; // LaneChangeLeft or LaneChangeRight, set by TryLaneChange
+        }
+        else
+        {
+            CurrentManeuverState = ManeuverState.LaneKeeping;
+            pendingManeuverState = ManeuverState.LaneKeeping;
+        }
+
+        // ───────── FLAGS ─────────
+        IsBlocked = leaderVehicle != null && leaderVehicle.CurrentSpeed < CurrentSpeed;
+        IsStuck = stuckTimer > stuckThreshold * 0.5f;
+        IsInQueue = leaderVehicle != null && CurrentSpeed < 2f;
+
+        // ───────── MOTION STATE ─────────
+        if (v < 0.2f)
+        {
+            if (CurrentSignalState == SignalStateEx.WaitingRed)
+                CurrentMotionState = MotionState.Stopped;
+            else if (IsBlocked)
+                CurrentMotionState = MotionState.Following;
+            else
+                CurrentMotionState = MotionState.Idle;
+        }
+        else
+        {
+            if (inRestartPhase)
+                CurrentMotionState = MotionState.Starting;
+            else if (idmAccel < -0.1f)
+                CurrentMotionState = MotionState.Braking;
+            else if (leaderVehicle != null)
+                CurrentMotionState = MotionState.Following;
+            else
+                CurrentMotionState = MotionState.Cruising;
+        }
+        // ───────── STATE CHANGE LOGGING ─────────
+        if (rec != null)
+        {
+            if (CurrentMotionState != PreviousMotionState)
+            {
+                rec.LogEvent(vehicleId, "STATE_MOTION", CurrentMotionState.ToString());
+            }
+
+            if (CurrentSignalState != PreviousSignalState)
+            {
+                rec.LogEvent(vehicleId, "STATE_SIGNAL", CurrentSignalState.ToString());
+            }
+
+            if (CurrentManeuverState != PreviousManeuverState)
+            {
+                rec.LogEvent(vehicleId, "STATE_MANEUVER", CurrentManeuverState.ToString());
+            }
+        }
+    }
     float ComputeSteering()
     {
         if (currentPath == null) return 0f;
 
         // Adaptive look-ahead: further ahead at higher speed
         float spd = CurrentSpeed;
-        float lookAhead = lookAheadBase + spd * 0.5f;
+        float lookAhead = lookAheadBase + Mathf.Clamp(spd, 0f, 10f) * 0.3f;
 
         // Find the target point ahead on the path
         Vector3 targetPoint = currentPath.GetPointAtDistance(
@@ -253,22 +483,48 @@ public class TrafficVehicle : MonoBehaviour
     {
         float v = CurrentSpeed;
 
-        // Signal stop overrides IDM
+        // ─────────────────────────────
+        // SIGNAL STOP
+        // ─────────────────────────────
         if (MustStopForSignal())
         {
-            if (!wasStoppedForSignal) { TrafficEventLogger.Log(name, "SIGNAL_STOP", ""); wasStoppedForSignal = true; }
             Vector3 stopLine = currentLane.path.waypoints[currentLane.path.waypoints.Count - 1].position;
             float distToLine = Vector3.Distance(transform.position, stopLine);
-            // Full braking proportional to how close we are
+
             float brakeFraction = Mathf.Clamp01((stopLineDistance - distToLine + 2f) / stopLineDistance);
-            idmAccel = -braking * Mathf.Max(brakeFraction, 0.3f);
+            idmAccel = -braking * Mathf.Max(brakeFraction, 0.4f);
+
             return;
         }
-        if (wasStoppedForSignal) { TrafficEventLogger.Log(name, "SIGNAL_GO", ""); wasStoppedForSignal = false; }
 
+        // ─────────────────────────────
+        // 🔥 GREEN SIGNAL EDGE DETECTION (FIX)
+        // ─────────────────────────────
+        if (prevSignalState != TrafficSignal.SignalState.Green &&
+            currentSignalStateCached == TrafficSignal.SignalState.Green)
+        {
+            inRestartPhase = true;
+            restartTimer = restartDuration;
+
+            idmAccel = Mathf.Clamp(acceleration * 0.8f, 1.0f, 2.0f);
+        }
+
+        // update previous state AFTER check
+        prevSignalState = currentSignalStateCached;
+
+        // ─────────────────────────────
+        // LOW SPEED ASSIST
+        // ─────────────────────────────
+        if (v < 1.0f)
+        {
+            idmAccel = Mathf.Max(idmAccel, 1.5f);
+        }
+
+        // ─────────────────────────────
+        // NORMAL IDM
+        // ─────────────────────────────
         if (leaderVehicle == null)
         {
-            // Free road — accelerate toward desired speed
             idmAccel = acceleration * (1f - Mathf.Pow(v / Mathf.Max(desiredSpeedMs, 0.1f), 4f));
         }
         else
@@ -276,10 +532,22 @@ public class TrafficVehicle : MonoBehaviour
             float vL = leaderVehicle.CurrentSpeed;
             float gap = Mathf.Max(Vector3.Distance(transform.position, leaderVehicle.transform.position) - vehicleLength, 0.1f);
             float deltaV = v - vL;
+
             float sStar = minimumGap + Mathf.Max(0f,
-                v * timeHeadway + (v * deltaV) / (2f * Mathf.Sqrt(Mathf.Max(acceleration * braking, 0.01f))));
-            idmAccel = acceleration * (1f - Mathf.Pow(v / Mathf.Max(desiredSpeedMs, 0.1f), 4f) - Mathf.Pow(sStar / gap, 2f));
-            idmAccel = Mathf.Max(idmAccel, -braking);
+                v * timeHeadway + (v * deltaV) / (2f * Mathf.Sqrt(Mathf.Max(acceleration * braking, 0.01f)))
+            );
+
+            idmAccel = acceleration * (
+                1f
+                - Mathf.Pow(v / Mathf.Max(desiredSpeedMs, 0.1f), 4f)
+                - Mathf.Pow(sStar / gap, 2f)
+            );
+
+            // prevent hard lock at low speed
+            if (v < 1.5f)
+                idmAccel = Mathf.Max(idmAccel, -braking * 0.3f);
+            else
+                idmAccel = Mathf.Max(idmAccel, -braking);
         }
     }
 
@@ -290,13 +558,26 @@ public class TrafficVehicle : MonoBehaviour
     bool MustStopForSignal()
     {
         if (currentSignal == null || currentLane == null) return false;
+        // Never brake while on a turn/intersection path — already committed
         if (currentPath != null && currentLane.path != null && currentPath != currentLane.path) return false;
-        if (currentSignal.GetStateForLane(currentLane) == TrafficSignal.SignalState.Green) return false;
         if (currentLane.path == null || currentLane.path.waypoints.Count == 0) return false;
+
+        TrafficSignal.SignalState state = currentSignal.GetStateForLane(currentLane);
+
+        // Green — never stop
+        if (state == TrafficSignal.SignalState.Green) return false;
+
         Vector3 stopLinePos = currentLane.path.waypoints[currentLane.path.waypoints.Count - 1].position;
         float distToLine = Vector3.Distance(transform.position, stopLinePos);
         float dynamicDist = Mathf.Max(stopLineDistance,
             (CurrentSpeed * CurrentSpeed) / (2f * Mathf.Max(braking, 1f)) + 6f);
+
+        // Yellow — only stop if not yet past the stop line braking zone.
+        // If already inside the zone or past the line, let the vehicle clear the intersection.
+        if (state == TrafficSignal.SignalState.Yellow)
+            return distToLine <= dynamicDist && distToLine > 1f;
+
+        // Red — stop whenever within braking distance
         return distToLine <= dynamicDist;
     }
 
@@ -311,49 +592,40 @@ public class TrafficVehicle : MonoBehaviour
         detectionFrame = 0;
 
         TrafficVehicle closest = null;
-        float closestD = 35f;
-        float corridorCos = 0.82f; // ±35° forward cone
+        float closestD = 30f;
 
-        Collider[] cols = Physics.OverlapSphere(transform.position, 35f);
+        Collider[] cols = Physics.OverlapSphere(transform.position, 30f);
+
         foreach (var col in cols)
         {
             if (col.gameObject == gameObject) continue;
-            if (col.transform.IsChildOf(transform)) continue;
+
             TrafficVehicle other = col.GetComponentInParent<TrafficVehicle>();
             if (other == null || other == this) continue;
 
+            // 🔥 MUST BE SAME PATH (CRITICAL FIX)
+            if (other.CurrentPath != currentPath) continue;
+
             Vector3 toOther = other.transform.position - transform.position;
             float dist = toOther.magnitude;
+
             if (dist < 0.5f) continue;
-            if (Vector3.Dot(transform.forward, toOther.normalized) < corridorCos) continue;
 
-            // Closing speed filter: skip if they are pulling away faster than 2 m/s
-            if (CurrentSpeed - other.CurrentSpeed < -2f) continue;
+            // 🔥 STRICT forward check (narrow cone)
+            float dot = Vector3.Dot(transform.forward, toOther.normalized);
+            if (dot < 0.95f) continue; // was 0.82 → too wide
 
-            if (dist < closestD) { closestD = dist; closest = other; }
+            // 🔥 MUST BE AHEAD (not side / behind)
+            if (Vector3.Dot(transform.forward, toOther) <= 0) continue;
+
+            if (dist < closestD)
+            {
+                closestD = dist;
+                closest = other;
+            }
         }
 
-        // Emergency: anything physically in front within vehicleLength+2m
-        Collider[] eCols = Physics.OverlapSphere(transform.position, vehicleLength + 2f);
-        foreach (var col in eCols)
-        {
-            if (col.gameObject == gameObject) continue;
-            if (col.transform.IsChildOf(transform)) continue;
-            TrafficVehicle other = col.GetComponentInParent<TrafficVehicle>();
-            if (other == null || other == this) continue;
-            Vector3 toOther = other.transform.position - transform.position;
-            if (Vector3.Dot(transform.forward, toOther.normalized) < 0.3f) continue;
-            float dist = toOther.magnitude;
-            if (closest == null || dist < closestD) { closestD = dist; closest = other; }
-        }
-
-        if (closest != leaderVehicle)
-        {
-            if (leaderVehicle != null) TrafficEventLogger.Log(name, "LEADER_LOST", "");
-            if (closest != null) TrafficEventLogger.Log(name, "LEADER_FOUND", closest.name);
-        }
         leaderVehicle = closest;
-        prevLeader = closest;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -363,7 +635,16 @@ public class TrafficVehicle : MonoBehaviour
     void UpdateDistanceTravelled()
     {
         if (currentPath == null) return;
-        distanceTravelled = currentPath.GetClosestDistance(transform.position);
+        float closest = currentPath.GetClosestDistance(transform.position);
+
+        // Snap directly — the old Lerp(0.2) never actually reached TotalLength,
+        // so `remaining` never fell below 2f and AdvanceToNextPath was never triggered
+        // at dead ends. Allow small backward correction by clamping to not jump
+        // more than 5m backward in a single frame (covers any spline discontinuity).
+        if (closest < distanceTravelled - 5f)
+            distanceTravelled = closest;
+        else
+            distanceTravelled = Mathf.Max(distanceTravelled, closest);
     }
 
     public void AssignLane(TrafficLane lane, bool fromSpawn = false)
@@ -383,34 +664,104 @@ public class TrafficVehicle : MonoBehaviour
             desiredSpeedMs = Mathf.Min(MaxSpeed, limitMs * variance);
         }
 
-        if (fromSpawn) TrafficEventLogger.Log(name, "SPAWN", "");
+        // Sync prevSignalState to the actual current state so the green-edge
+        // detector doesn't fire a false restart on the very first frame.
+        if (currentSignal != null)
+            prevSignalState = currentSignal.GetStateForLane(lane);
+        else
+            prevSignalState = TrafficSignal.SignalState.Green;
+
+        routeHistory.Add("L:" + lane.name);
     }
 
     void AdvanceToNextPath()
     {
-        if (currentLane == null) { Despawn(); return; }
+        if (currentLane == null)
+        {
+            rec?.LogEvent(vehicleId, "FAIL_NO_LANE");
+            Despawn();
+            return;
+        }
 
+        bool isTurnPath = currentPath != currentLane.path;
+
+        // ─────────────────────────────────────────────
+        // 1. FINISH TURN → SNAP BACK TO LANE PATH
+        // ─────────────────────────────────────────────
+        if (isTurnPath)
+        {
+            rec?.LogEvent(vehicleId, "TURN_COMPLETE", currentLane.name);
+
+            AssignLane(currentLane);
+            return;
+        }
+
+        // ─────────────────────────────────────────────
+        // 2. NORMAL LANE → PICK TURN PATH
+        // ─────────────────────────────────────────────
         if (currentLane.nextPaths != null && currentLane.nextPaths.Count > 0)
         {
             var lp = ChooseTurnPath();
-            if (lp != null && lp.path != null && lp.targetLane != null)
+
+            if (lp == null || lp.path == null || lp.targetLane == null)
             {
-                currentPath = lp.path;
-                currentLane = lp.targetLane;
-                distanceTravelled = currentPath.GetClosestDistance(transform.position);
+                rec?.LogEvent(vehicleId, "FAIL_TURN_SELECTION", currentLane.name);
+                Debug.LogWarning($"[FAIL SAFE] {vehicleId} couldn't pick turn path on {currentLane.name}");
 
-                if (laneManager != null)
-                    laneManager.RefreshVehicle(this);
+                // 🔥 fallback instead of doing nothing
+                if (currentLane.nextLanes != null && currentLane.nextLanes.Count > 0)
+                {
+                    var fallbackLane = currentLane.nextLanes[Random.Range(0, currentLane.nextLanes.Count)];
 
+                    rec?.LogEvent(vehicleId, "FALLBACK_LANE", fallbackLane.name);
+                    AssignLane(fallbackLane);
+                    return;
+                }
+
+                // No fallback lanes either — this is a true dead end.
+                rec?.LogEvent(vehicleId, "FAIL_NO_FALLBACK");
+                Despawn();
                 return;
             }
-        }
 
-        if (currentLane.nextLanes != null && currentLane.nextLanes.Count > 0)
-        {
-            AssignLane(currentLane.nextLanes[Random.Range(0, currentLane.nextLanes.Count)]);
+            // ✅ SUCCESS PATH SWITCH
+            rec?.LogEvent(
+    vehicleId,
+    "PATH_SWITCH",
+    lp.path.name,                 // ✅ correct path
+    GetIntersectionId(),
+    "",
+    -1f,
+    GetRouteTrace()
+);
+            routeHistory.Add("P:" + lp.path.name);
+            currentPath = lp.path;
+            currentLane = lp.targetLane;
+            distanceTravelled = currentPath.GetClosestDistance(transform.position);
+
+            if (laneManager != null)
+                laneManager.RefreshVehicle(this);
+
             return;
         }
+
+        // ─────────────────────────────────────────────
+        // 3. FALLBACK → NEXT LANES
+        // ─────────────────────────────────────────────
+        if (currentLane.nextLanes != null && currentLane.nextLanes.Count > 0)
+        {
+            var nextLane = currentLane.nextLanes[Random.Range(0, currentLane.nextLanes.Count)];
+
+            rec?.LogEvent(vehicleId, "LANE_CONTINUE", nextLane.name);
+            routeHistory.Add("FALLBACK:" + nextLane.name);
+            AssignLane(nextLane);
+            return;
+        }
+
+        // ─────────────────────────────────────────────
+        // 4. DEAD END
+        // ─────────────────────────────────────────────
+        rec?.LogEvent(vehicleId, "DEAD_END");
 
         Despawn();
     }
@@ -422,28 +773,85 @@ public class TrafficVehicle : MonoBehaviour
 
         float[] weights = new float[paths.Count];
         float total = 0f;
+
         for (int i = 0; i < paths.Count; i++)
         {
             var lp = paths[i];
-            if (lp == null || lp.targetLane == null) continue;
+            if (lp == null || lp.path == null || lp.targetLane == null) continue;
+
             Vector3 fwd = transform.forward;
             Vector3 tFwd = lp.targetLane.transform.forward;
             float ang = Mathf.Acos(Mathf.Clamp(Vector3.Dot(fwd, tFwd), -1f, 1f)) * Mathf.Rad2Deg;
-            // Weighted toward straight (0°) > right turn > left turn
-            weights[i] = ang < 30f ? 0.5f : ang > 150f ? 0.05f
-                       : Vector3.Dot(Vector3.Cross(fwd, tFwd), Vector3.up) >= 0f ? 0.3f : 0.15f;
+
+            weights[i] = ang < 30f ? 0.5f :
+                         ang > 150f ? 0.05f :
+                         Vector3.Dot(Vector3.Cross(fwd, tFwd), Vector3.up) >= 0f ? 0.3f : 0.15f;
+
             total += weights[i];
         }
-        if (total <= 0f) return paths[Random.Range(0, paths.Count)];
-        float pick = Random.value * total, acc = 0f;
-        for (int i = 0; i < paths.Count; i++) { acc += weights[i]; if (pick <= acc) return paths[i]; }
-        return paths[paths.Count - 1];
+
+        // If no valid path had weight, pick first fully-valid entry
+        if (total <= 0f)
+        {
+            for (int i = 0; i < paths.Count; i++)
+            {
+                var lp = paths[i];
+                if (lp != null && lp.path != null && lp.targetLane != null) return lp;
+            }
+            return null;
+        }
+
+        float pick = Random.value * total;
+        float acc = 0f;
+
+        for (int i = 0; i < paths.Count; i++)
+        {
+            acc += weights[i];
+
+            if (pick <= acc)
+            {
+                var chosen = paths[i];
+                if (chosen == null || chosen.path == null || chosen.targetLane == null) continue;
+
+                float prob = weights[i] / total;
+
+                rec?.LogEvent(
+                    vehicleId,
+                    "TURN_DECISION",
+                    chosen.path.name,
+                    GetIntersectionId(),
+                    $"choice_{i}",
+                    prob,
+                    GetRouteTrace()
+                );
+
+                return chosen;
+            }
+        }
+
+        // Fallback: last entry with a valid path
+        for (int i = paths.Count - 1; i >= 0; i--)
+        {
+            var lp = paths[i];
+            if (lp != null && lp.path != null && lp.targetLane != null) return lp;
+        }
+        return null;
     }
 
     void Despawn()
     {
-        TrafficEventLogger.Log(name, "DESPAWN", "");
         isWaitingForLane = true;
+
+        rec?.LogEvent(
+            vehicleId,
+            "DESPAWN",
+            GetPathId(),
+            GetIntersectionId(),
+            "",
+            -1f,
+            GetRouteTrace()
+        );
+
         Destroy(gameObject, 0.3f);
     }
 
@@ -486,12 +894,25 @@ public class TrafficVehicle : MonoBehaviour
         float reqGap = minimumGap + CurrentSpeed * 1.2f;
         if (gap < reqGap) return false;
 
+        // Determine direction before switching currentLane
+        pendingManeuverState = (target == leftLane) ? ManeuverState.LaneChangeLeft : ManeuverState.LaneChangeRight;
+
         currentLane = target;
         currentPath = target.path;
         distanceTravelled = currentPath.GetClosestDistance(transform.position);
         laneChangeCooldown = 5f;
-        TrafficEventLogger.Log(name, "LANE_CHANGE", target.name);
         if (laneManager != null) laneManager.RefreshVehicle(this);
+        routeHistory.Add("LC:" + target.name);
+
+        rec?.LogEvent(
+            vehicleId,
+            "LANE_CHANGE",
+            target.path.name,
+            GetIntersectionId(),
+            pendingManeuverState == ManeuverState.LaneChangeLeft ? "left" : "right",
+            CurrentSpeed,
+            GetRouteTrace()
+        );
         return true;
     }
 

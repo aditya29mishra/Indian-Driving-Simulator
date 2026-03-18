@@ -255,7 +255,6 @@ public class SemaphoreSimulator : MonoBehaviour
 
             redTimer = redTime;
             yellowOn = true;
-            Debug.Log("32");
         }
     }
 

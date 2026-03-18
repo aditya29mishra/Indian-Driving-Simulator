@@ -7,10 +7,18 @@ public class CarWheels : MonoBehaviour
     public bool useCustomCenterOfMass = false;
     public Vector3 centerOfMassOffset;
 
+    private Rigidbody rb;
+
+    void Awake()
+    {
+        rb = GetComponent<Rigidbody>();
+    }
+
     void Start()
     {
         CheckCenterOfMass();
     }
+
     void Update()
     {
         UpdateMeshesPositions();
@@ -18,20 +26,22 @@ public class CarWheels : MonoBehaviour
 
     private void CheckCenterOfMass()
     {
-        if (useCustomCenterOfMass)
-        {
-            GetComponent<Rigidbody>().centerOfMass = centerOfMassOffset;
-        }
+        if (!useCustomCenterOfMass) return;
+        if (rb == null) rb = GetComponent<Rigidbody>();
+        if (rb != null)
+            rb.centerOfMass = centerOfMassOffset;
     }
 
     private void UpdateMeshesPositions()
     {
-        for (int i = 0; i < WheelColliders.Length; i++)
-        {
-            Quaternion quat;
-            Vector3 pos;
-            WheelColliders[i].GetWorldPose(out pos, out quat);
+        if (WheelColliders == null || tireMeshes == null) return;
 
+        int count = Mathf.Min(WheelColliders.Length, tireMeshes.Length);
+        for (int i = 0; i < count; i++)
+        {
+            if (WheelColliders[i] == null || tireMeshes[i] == null) continue;
+
+            WheelColliders[i].GetWorldPose(out Vector3 pos, out Quaternion quat);
             tireMeshes[i].position = pos;
             tireMeshes[i].rotation = quat;
         }
@@ -40,7 +50,9 @@ public class CarWheels : MonoBehaviour
 #if UNITY_EDITOR
     private void OnDrawGizmosSelected()
     {
-        CheckCenterOfMass();
+        // Do not call CheckCenterOfMass here — GetComponent is expensive every
+        // gizmo draw and throws if Rigidbody is missing on an unfinished prefab.
+        // Center of mass is applied at runtime in Start().
     }
 #endif
 }

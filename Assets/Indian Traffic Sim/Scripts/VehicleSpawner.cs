@@ -81,8 +81,9 @@ public class VehicleSpawner : MonoBehaviour
     public float spawnClearDistance = 15f;
 
     [Header("Systems")]
-    public LaneManager   laneManager;
-    public TrafficSignal trafficSignal;
+    public LaneManager laneManager;
+    [Tooltip("Assign all TrafficSignal objects in the scene here — one per approach direction if using per-direction signals, or just the one shared signal for a standard 4-way. Each vehicle will be matched to the signal that contains its lane.")]
+    public List<TrafficSignal> trafficSignals = new List<TrafficSignal>();
 
     [Header("Driver Distribution")]
     public DriverProfileDistribution profileDistribution = new DriverProfileDistribution();
@@ -112,8 +113,13 @@ public class VehicleSpawner : MonoBehaviour
                 lastSpawned[lane]   = null;
             }
         }
-        if (trafficSignal == null) trafficSignal = FindObjectOfType<TrafficSignal>();
-        if (laneManager   == null) laneManager   = FindObjectOfType<LaneManager>();
+
+        // Auto-collect all signals in scene if none manually assigned
+        if (trafficSignals == null || trafficSignals.Count == 0)
+        {
+            trafficSignals = new List<TrafficSignal>(FindObjectsOfType<TrafficSignal>());
+        }
+        if (laneManager == null) laneManager = FindObjectOfType<LaneManager>();
     }
 
     void Update()
@@ -176,8 +182,12 @@ public class VehicleSpawner : MonoBehaviour
         var cfg = BuildConfig(lane);
         vehicle.Initialize(cfg);
 
-        // Assign system references
-        vehicle.currentSignal = trafficSignal;
+        // Assign the signal that actually contains this vehicle's lane.
+        // With a 4-way Indian intersection using per-direction signals, each
+        // approach has its own TrafficSignal. Assigning the wrong one (or one
+        // shared signal that doesn't contain the lane) makes the vehicle always
+        // read Green and never stop.
+        vehicle.currentSignal = FindSignalForLane(lane);
         vehicle.laneManager   = laneManager;
         vehicle.AssignLane(lane, fromSpawn: true);
 
@@ -186,6 +196,22 @@ public class VehicleSpawner : MonoBehaviour
         laneOccupancy[lane]++;
         lastSpawned[lane] = vehicle;
         vehicleGO.AddComponent<SpawnTracker>().Init(this, lane);
+    }
+
+    // ─── Signal lookup — find the signal that owns this lane ─────────────────
+    TrafficSignal FindSignalForLane(TrafficLane lane)
+    {
+        if (lane == null || trafficSignals == null) return null;
+        foreach (var sig in trafficSignals)
+        {
+            if (sig == null) continue;
+            // Check if any group in this signal contains the lane
+            foreach (var group in sig.groups)
+                foreach (var l in group.lanes)
+                    if (l == lane) return sig;
+        }
+        // Lane not found in any signal — return first signal as fallback (will warn via GetStateForLane)
+        return trafficSignals.Count > 0 ? trafficSignals[0] : null;
     }
 
     // ─── Config builder — all randomness lives here ───────────────────────
