@@ -36,7 +36,15 @@ public class DestinationSystem : IVehicleBehaviour
         this.owner = owner;
     }
 
-    public void OnSpawn()  { }
+    public void OnSpawn()
+    {
+        // Log destination assignment so CSV shows where each vehicle is headed
+        if (ctx.DestNode != null)
+            ctx.Log("DESTINATION_ASSIGNED",
+                ctx.DestNode.name,
+                ctx.DestNode.nodeType.ToString(),
+                $"pos={ctx.DestNode.transform.position:F0}");
+    }
     public void OnDespawn(){ }
 
     public void Tick(float dt)
@@ -51,20 +59,55 @@ public class DestinationSystem : IVehicleBehaviour
 
     void CheckDestinationArrival()
     {
-        if (ctx.DestNode == null || ctx.CurrentLane == null) return;
+        if (ctx.CurrentLane == null) return;
         if (ctx.CurrentLane.road == null) return;
 
-        // Arrived if the current lane's road is connected to the destination node
-        // (i.e. this road has DestNode as its startNode or endNode)
+        // Don't check while physically on a turn arc.
+        // CurrentPath != CurrentLane.path means arc is in progress.
+        bool onArc = ctx.CurrentPath != null &&
+                     ctx.CurrentLane.path != null &&
+                     ctx.CurrentPath != ctx.CurrentLane.path;
+        if (onArc) return;
+
+        // Only despawn here on EXACT destination match.
+        // If the vehicle is on any other terminal lane (wrong arm), let it
+        // drive to the physical end of that lane first — AdvanceToNextPath
+        // branch 4 handles the terminal despawn when nearEnd fires.
+        // This way vehicles always drive to the road tip before vanishing,
+        // not disappear the instant they exit the intersection arc.
+        if (ctx.DestNode == null) return;
+
         TrafficRoad road = ctx.CurrentLane.road;
         if (road.startNode == ctx.DestNode || road.endNode == ctx.DestNode)
         {
-            // Clean arrival — log and despawn
-            ctx.Recorder?.LogEvent(ctx.VehicleId, "ARRIVED",
-                ctx.CurrentLane.name, ctx.DestNode.name, "", -1f, ctx.GetRouteTrace());
-            ctx.IsWaitingForLane = true;
-            Object.Destroy(owner.gameObject, 0.3f);
+            ArriveClean("ARRIVED");
         }
+    }
+
+    bool IsTerminalLane(TrafficLane lane)
+    {
+        if (lane == null) return false;
+        if (lane.nextLanes != null && lane.nextLanes.Count > 0) return false;
+        if (lane.nextPaths != null)
+        {
+            foreach (var lp in lane.nextPaths)
+                if (lp != null && lp.path != null && lp.targetLane != null) return false;
+        }
+        bool endsAtTrueTip = (lane.road.startNode != null &&
+                              lane.road.startNode.connectedRoads.Count == 1) ||
+                             (lane.road.endNode   != null &&
+                              lane.road.endNode.connectedRoads.Count   == 1);
+        return endsAtTrueTip;
+    }
+
+    void ArriveClean(string eventName)
+    {
+        ctx.Recorder?.LogEvent(ctx.VehicleId, eventName,
+            ctx.CurrentLane.name,
+            ctx.DestNode != null ? ctx.DestNode.name : "terminal",
+            "", -1f, ctx.GetRouteTrace());
+        ctx.IsWaitingForLane = true;
+        Object.Destroy(owner.gameObject, 0.3f);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -95,16 +138,18 @@ public class DestinationSystem : IVehicleBehaviour
             float alignment = Mathf.Clamp01((Vector3.Dot(toDestDir, turnExitDir) + 1f) * 0.5f);
             // alignment: 0 = pointing directly away, 0.5 = perpendicular, 1.0 = pointing right at dest
 
-            // Bias multiplier: 0.5× for wrong direction, up to 2.5× for correct direction
-            // Profile affects how strongly the vehicle respects the destination:
-            // Cautious follows destination more faithfully
-            // Aggressive cares less — will take a faster gap even in the wrong direction
-            float maxBias = ctx.DriverProfile == TrafficVehicle.DriverProfile.Cautious   ? 3.0f
-                          : ctx.DriverProfile == TrafficVehicle.DriverProfile.Aggressive ? 1.5f
-                          : 2.0f;
+            // Strong bias — especially important in single-intersection maps where every
+            // road arm is a dead end. Wrong turn = guaranteed FAIL 20s later.
+            // 0.1× for wrong direction, up to 5× for correct direction.
+            // Profile modulates how strictly the vehicle respects the destination:
+            // Cautious = very obedient, Aggressive = still biased but some randomness.
+            float maxBias = ctx.DriverProfile == TrafficVehicle.DriverProfile.Cautious   ? 6.0f
+                          : ctx.DriverProfile == TrafficVehicle.DriverProfile.Aggressive ? 3.0f
+                          : 4.5f;
 
-            float biasMult = Mathf.Lerp(0.4f, maxBias, alignment);
+            float biasMult = Mathf.Lerp(0.1f, maxBias, alignment);
             weights[i] *= biasMult;
         }
     }
+    
 }

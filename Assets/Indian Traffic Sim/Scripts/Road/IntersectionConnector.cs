@@ -2,199 +2,274 @@ using System.Collections.Generic;
 using UnityEngine;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IntersectionConnector — Bezier turn path generation between approach lanes
+// IntersectionConnector — Bezier turn arc generation between approach lanes.
 //
-// Generates smooth Bezier curves for vehicle turns at intersections.
-// Connects incoming lanes to outgoing lanes with appropriate turn paths.
+// Lane direction detection: position-based.
+//   Arriving lane  = waypoints[last] closer to intersection centre
+//   Departing lane = waypoints[0]    closer to intersection centre
 //
-// Talks to: TrafficNode (nodes), TrafficRoad (roads), TrafficLane (lanes), TrafficPath (creates paths)
+// Lane pairing: purely index-based.
+//   Lanes in each set are sorted by laneIndex ascending (RoadGenerator order).
+//   Two booleans control the pairing:
+//     flipArriving  — reverses arriving set order  (driven by arriving forwardDirection)
+//     flipDeparting — reverses departing set order  (driven by departing forwardDirection)
+//   Final: arriving[effectiveI] → departing[effectiveJ]
+//
+// Talks to: TrafficIntersectionNode, TrafficRoad, TrafficLane, TrafficPath
 // ─────────────────────────────────────────────────────────────────────────────
 
 public class IntersectionConnector : MonoBehaviour
 {
-    public TrafficNode nodeW;
-    public TrafficNode nodeS;
-    public TrafficNode nodeE;
-    public TrafficNode nodeN;
+    [Header("Intersection Node")]
+    [Tooltip("The TrafficIntersectionNode at the centre of this junction.")]
+    public TrafficIntersectionNode intersectionNode;
 
+    [Header("Arc Settings")]
     public float turnRadius = 6f;
-    public int resolution = 12;
+    public int   resolution = 12;
 
-    /// <summary>Generates turn paths for the intersection.</summary>
+    // ─────────────────────────────────────────────────────────────────────
+    // Generation
+    // ─────────────────────────────────────────────────────────────────────
+
     [ContextMenu("Generate Intersection")]
-    public void Generate()
+    public void AutoGenerate()
     {
+        if (intersectionNode == null)
+        {
+            Debug.LogWarning("[IntersectionConnector] intersectionNode not assigned.");
+            return;
+        }
+
+        var roads = intersectionNode.connectedRoads;
+        if (roads.Count < 2)
+        {
+            Debug.LogError($"[IntersectionConnector] '{intersectionNode.name}' has only " +
+                           $"{roads.Count} road(s). Need at least 2.");
+            return;
+        }
+
+        int expected = intersectionNode.ExpectedRoadCount();
+        if (expected > 0 && roads.Count != expected)
+            Debug.LogWarning($"[IntersectionConnector] '{intersectionNode.name}' is " +
+                             $"{intersectionNode.intersectionType} (expects {expected} roads) " +
+                             $"but has {roads.Count}. Generating anyway.");
+
+        ValidateRoadOrientations(roads);
         ClearOld();
+        GenerateFromRoads(roads);
 
-        Connect(nodeW, nodeN); // right
-        Connect(nodeW, nodeE); // straight
-        Connect(nodeW, nodeS); // left
-        //Connect(nodeW, nodeW); // u-turn
-
-        Connect(nodeS, nodeE);
-        Connect(nodeS, nodeN);
-        Connect(nodeS, nodeW);
-        //Connect(nodeS, nodeS);
-
-        Connect(nodeE, nodeS);
-        Connect(nodeE, nodeW);
-        Connect(nodeE, nodeN);
-        //Connect(nodeE, nodeE);
-
-        Connect(nodeN, nodeW);
-        Connect(nodeN, nodeS);
-        Connect(nodeN, nodeE);
-        //Connect(nodeN, nodeN);
+        int arcCount = roads.Count * (roads.Count - 1);
+        Debug.Log($"[IntersectionConnector] '{intersectionNode.name}' " +
+                  $"({intersectionNode.intersectionType}) — " +
+                  $"{roads.Count} arms, {arcCount} arcs generated.");
     }
 
-    void Connect(TrafficNode fromNode, TrafficNode toNode)
+    // ─────────────────────────────────────────────────────────────────────
+    // Validation
+    // ─────────────────────────────────────────────────────────────────────
+
+    void ValidateRoadOrientations(List<TrafficRoad> roads)
     {
-        if (fromNode.connectedRoads.Count == 0 || toNode.connectedRoads.Count == 0)
-            return;
+        Vector3 centre = intersectionNode.transform.position;
+        bool allOk = true;
 
-        TrafficRoad inRoad = fromNode.connectedRoads[0];
-        TrafficRoad outRoad = toNode.connectedRoads[0];
-
-        List<TrafficLane> inLanes = GetForwardLanes(inRoad);
-        List<TrafficLane> outLanes = GetBackwardLanes(outRoad);
-
-        int laneCount = Mathf.Min(inLanes.Count, outLanes.Count);
-
-        for (int i = 0; i < laneCount; i++)
+        foreach (var road in roads)
         {
-            TrafficLane inLane = inLanes[i];
+            if (road == null) continue;
+            var arriving  = GetArrivingLanes(road,  centre);
+            var departing = GetDepartingLanes(road, centre);
 
-            int outIndex = i;
-
-            if (IsReverseTurn(fromNode, toNode))
+            if (arriving.Count == 0)
             {
-                outIndex = outLanes.Count - 1 - i;
+                Debug.LogWarning($"[IntersectionConnector] '{road.name}' has NO arriving lanes " +
+                                 $"at '{intersectionNode.name}'. Check road orientation.");
+                allOk = false;
             }
+            if (departing.Count == 0)
+            {
+                Debug.LogWarning($"[IntersectionConnector] '{road.name}' has NO departing lanes " +
+                                 $"at '{intersectionNode.name}'. Check road orientation.");
+                allOk = false;
+            }
+            if (arriving.Count > 0 && departing.Count > 0 &&
+                arriving.Count != departing.Count)
+            {
+                Debug.LogWarning($"[IntersectionConnector] '{road.name}': " +
+                                 $"{arriving.Count} arriving but {departing.Count} departing. " +
+                                 $"Check forwardLanes == backwardLanes in TrafficRoad.");
+                allOk = false;
+            }
+        }
 
-            TrafficLane outLane = outLanes[outIndex];
+        if (allOk)
+            Debug.Log($"[IntersectionConnector] Validation passed at '{intersectionNode.name}'.");
+    }
 
-            CreateCurve(inLane, outLane);
+    // ─────────────────────────────────────────────────────────────────────
+    // Core generation
+    // ─────────────────────────────────────────────────────────────────────
+
+    void GenerateFromRoads(List<TrafficRoad> roads)
+    {
+        Vector3 centre = intersectionNode.transform.position;
+        for (int i = 0; i < roads.Count; i++)
+            for (int j = 0; j < roads.Count; j++)
+            {
+                if (i == j) continue;
+                ConnectRoads(roads[i], roads[j], centre);
+            }
+    }
+
+    void ConnectRoads(TrafficRoad inRoad, TrafficRoad outRoad, Vector3 centre)
+    {
+        if (inRoad == null || outRoad == null) return;
+
+        var inLanes  = GetArrivingLanes(inRoad,  centre);
+        var outLanes = GetDepartingLanes(outRoad, centre);
+        if (inLanes.Count == 0 || outLanes.Count == 0) return;
+
+        // Sort both sets by laneIndex ascending — consistent creation order from RoadGenerator
+        inLanes.Sort((a, b)  => a.laneIndex.CompareTo(b.laneIndex));
+        outLanes.Sort((a, b) => a.laneIndex.CompareTo(b.laneIndex));
+
+        // Bool 1 — flipArriving:  reverse the arriving set order
+        // Bool 2 — flipDeparting: reverse the departing set order
+        // Both driven by forwardDirection of their respective set's first lane.
+        bool flipArriving  = inLanes.Count  > 0 && inLanes[0].forwardDirection;
+        bool flipDeparting = outLanes.Count > 0 && outLanes[0].forwardDirection;
+
+        int count = Mathf.Min(inLanes.Count, outLanes.Count);
+        for (int i = 0; i < count; i++)
+        {
+            int inIdx  = flipArriving  ? inLanes.Count  - 1 - i : i;
+            int outIdx = flipDeparting ? outLanes.Count - 1 - i : i;
+            CreateCurve(inLanes[inIdx], outLanes[outIdx]);
         }
     }
 
-    List<TrafficLane> GetForwardLanes(TrafficRoad road)
+    // ─────────────────────────────────────────────────────────────────────
+    // Position-based lane classification
+    // ─────────────────────────────────────────────────────────────────────
+
+    public List<TrafficLane> GetArrivingLanes(TrafficRoad road, Vector3 intersectionCentre)
     {
-        List<TrafficLane> lanes = new List<TrafficLane>();
-
-        foreach (var l in road.lanes)
-            if (l.forwardDirection)
-                lanes.Add(l);
-
-        lanes.Sort((a, b) =>
+        var result = new List<TrafficLane>();
+        foreach (var lane in road.lanes)
         {
-            float da = Vector3.Dot(a.transform.position - road.transform.position, road.transform.right);
-            float db = Vector3.Dot(b.transform.position - road.transform.position, road.transform.right);
-            return da.CompareTo(db);
-        });
-
-        return lanes;
+            if (lane?.path == null || lane.path.waypoints == null ||
+                lane.path.waypoints.Count < 2) continue;
+            Vector3 wp0   = lane.path.waypoints[0].position;
+            Vector3 wpEnd = lane.path.waypoints[lane.path.waypoints.Count - 1].position;
+            if (Vector3.Distance(wpEnd, intersectionCentre) <
+                Vector3.Distance(wp0,   intersectionCentre))
+                result.Add(lane);
+        }
+        return result;
     }
 
-    List<TrafficLane> GetBackwardLanes(TrafficRoad road)
+    public List<TrafficLane> GetDepartingLanes(TrafficRoad road, Vector3 intersectionCentre)
     {
-        List<TrafficLane> lanes = new List<TrafficLane>();
-
-        foreach (var l in road.lanes)
-            if (!l.forwardDirection)
-                lanes.Add(l);
-
-        lanes.Sort((a, b) =>
+        var result = new List<TrafficLane>();
+        foreach (var lane in road.lanes)
         {
-            float da = Vector3.Dot(a.transform.position - road.transform.position, road.transform.right);
-            float db = Vector3.Dot(b.transform.position - road.transform.position, road.transform.right);
-            return da.CompareTo(db);
-        });
-
-        return lanes;
+            if (lane?.path == null || lane.path.waypoints == null ||
+                lane.path.waypoints.Count < 2) continue;
+            Vector3 wp0   = lane.path.waypoints[0].position;
+            Vector3 wpEnd = lane.path.waypoints[lane.path.waypoints.Count - 1].position;
+            if (Vector3.Distance(wp0,   intersectionCentre) <
+                Vector3.Distance(wpEnd, intersectionCentre))
+                result.Add(lane);
+        }
+        return result;
     }
 
-    bool IsReverseTurn(TrafficNode fromNode, TrafficNode toNode)
-    {
-        // STRAIGHT
-        if (fromNode == nodeW && toNode == nodeE) return true;
-        if (fromNode == nodeE && toNode == nodeW) return true;
-        if (fromNode == nodeN && toNode == nodeS) return true;
-        if (fromNode == nodeS && toNode == nodeN) return true;
-
-        // RIGHT
-        if (fromNode == nodeW && toNode == nodeN) return true;
-        if (fromNode == nodeN && toNode == nodeE) return true;
-        if (fromNode == nodeE && toNode == nodeS) return true;
-        if (fromNode == nodeS && toNode == nodeW) return true;
-
-        // LEFT
-        if (fromNode == nodeW && toNode == nodeS) return true;
-        if (fromNode == nodeS && toNode == nodeE) return true;
-        if (fromNode == nodeE && toNode == nodeN) return true;
-        if (fromNode == nodeN && toNode == nodeW) return true;
-
-        // UTURN
-        //if (fromNode == toNode) return true;
-
-        return false;
-    }
+    // ─────────────────────────────────────────────────────────────────────
+    // Bezier arc creation
+    // ─────────────────────────────────────────────────────────────────────
 
     void CreateCurve(TrafficLane fromLane, TrafficLane toLane)
     {
-        Vector3 start = fromLane.path.waypoints[fromLane.path.waypoints.Count - 1].position;
-        Vector3 end = toLane.path.waypoints[0].position;
+        if (fromLane?.path == null || fromLane.path.waypoints.Count == 0) return;
+        if (toLane?.path   == null || toLane.path.waypoints.Count   == 0) return;
 
-        Vector3 dirStart = fromLane.transform.forward;
-        Vector3 dirEnd = toLane.transform.forward;
+        Vector3 start    = fromLane.path.waypoints[fromLane.path.waypoints.Count - 1].position;
+        Vector3 end      = toLane.path.waypoints[0].position;
+        Vector3 dirStart = GetPathTipDirection(fromLane.path, atEnd: true);
+        Vector3 dirEnd   = GetPathTipDirection(toLane.path,   atEnd: false);
 
-        Vector3 p0 = start;
-        Vector3 p1 = start + dirStart * turnRadius;
-        Vector3 p2 = end - dirEnd * turnRadius;
-        Vector3 p3 = end;
+        Vector3 p0 = start,  p1 = start + dirStart * turnRadius;
+        Vector3 p3 = end,    p2 = end   - dirEnd   * turnRadius;
 
-        string fromId = $"{fromLane.name}";
-        string toId = $"{toLane.name}";
-
-        GameObject obj = new GameObject($"Turn_{fromId}_TO_{toId}");
+        var obj              = new GameObject($"Turn_{fromLane.name}_TO_{toLane.name}");
         obj.transform.parent = transform;
 
-        TrafficPath path = obj.AddComponent<TrafficPath>();
+        var path  = obj.AddComponent<TrafficPath>();
         path.road = fromLane.road;
         path.lane = toLane;
 
         for (int i = 0; i <= resolution; i++)
         {
-            float t = i / (float)resolution;
+            float   t  = i / (float)resolution;
+            float   t1 = 1f - t;
+            Vector3 pt = t1*t1*t1*p0 + 3f*t1*t1*t*p1 + 3f*t1*t*t*p2 + t*t*t*p3;
 
-            Vector3 point =
-                Mathf.Pow(1 - t, 3) * p0 +
-                3 * Mathf.Pow(1 - t, 2) * t * p1 +
-                3 * (1 - t) * t * t * p2 +
-                Mathf.Pow(t, 3) * p3;
-
-            GameObject wp = new GameObject($"TurnWP_{i}");
-            wp.transform.position = point;
-            wp.transform.parent = obj.transform;
-
+            var wp               = new GameObject($"TurnWP_{i}");
+            wp.transform.position = pt;
+            wp.transform.parent  = obj.transform;
             path.waypoints.Add(wp.transform);
         }
 
-        TrafficLane.LanePath lanePath = new TrafficLane.LanePath
-        {
-            path = path,
-            targetLane = toLane
-        };
-
-        fromLane.nextPaths.Add(lanePath);
-
-        Debug.Log($"[CONNECT] {fromLane.name} → {toLane.name}");
+        fromLane.nextPaths.Add(new TrafficLane.LanePath { path = path, targetLane = toLane });
     }
+
+    Vector3 GetPathTipDirection(TrafficPath path, bool atEnd)
+    {
+        var wps = path.waypoints;
+        if (wps.Count < 2) return Vector3.forward;
+        return atEnd
+            ? (wps[wps.Count - 1].position - wps[wps.Count - 2].position).normalized
+            : (wps[1].position             - wps[0].position).normalized;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Cleanup
+    // ─────────────────────────────────────────────────────────────────────
 
     void ClearOld()
     {
-        foreach (Transform child in transform)
+        for (int i = transform.childCount - 1; i >= 0; i--)
+            DestroyImmediate(transform.GetChild(i).gameObject);
+
+        if (intersectionNode == null) return;
+        foreach (var road in intersectionNode.connectedRoads)
         {
-            DestroyImmediate(child.gameObject);
+            if (road == null) continue;
+            foreach (var lane in road.lanes)
+                if (lane != null) lane.nextPaths.Clear();
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Gizmo
+    // ─────────────────────────────────────────────────────────────────────
+
+#if UNITY_EDITOR
+    void OnDrawGizmos()
+    {
+        if (intersectionNode == null) return;
+
+        Vector3 centre = intersectionNode.transform.position + Vector3.up * 0.5f;
+        Gizmos.color   = new Color(1f, 0.9f, 0f, 0.9f);
+        Gizmos.DrawWireSphere(centre, 1.0f);
+
+        foreach (var road in intersectionNode.connectedRoads)
+        {
+            if (road == null) continue;
+            Gizmos.color = new Color(0.2f, 0.8f, 1f, 0.5f);
+            Gizmos.DrawLine(centre, road.transform.position + Vector3.up * 0.5f);
+            Gizmos.DrawWireSphere(road.transform.position + Vector3.up * 0.5f, 0.4f);
+        }
+    }
+#endif
 }

@@ -171,16 +171,15 @@ public class IntersectionPrioritySystem : IVehicleBehaviour
     public void OnTurnCommitted(TrafficPath chosenArc, Vector3 intersectionCentre)
     {
         registeredAt   = intersectionCentre;
-        priorityJitter = Random.Range(0f, 1f); // random per green phase
+        priorityJitter = Random.Range(0f, 1f);
 
         float priority = ComputePriority(chosenArc);
 
-        // Register
         var entry = new IntersectionRegistry.IntersectionEntry
         {
-            vehicle    = owner,
-            chosenArc  = chosenArc,
-            priority   = priority,
+            vehicle     = owner,
+            chosenArc   = chosenArc,
+            priority    = priority,
             arcMidpoint = chosenArc != null && chosenArc.waypoints.Count > 0
                 ? chosenArc.GetPointAtDistance(chosenArc.TotalLength * 0.5f)
                 : intersectionCentre
@@ -188,7 +187,13 @@ public class IntersectionPrioritySystem : IVehicleBehaviour
         IntersectionRegistry.Register(intersectionCentre, entry);
         isRegistered = true;
 
-        // Immediately check if we need to yield
+        // Log the turn commitment and priority score
+        ctx.Log("INTERSECTION_REGISTERED",
+            chosenArc?.name ?? "none",
+            intersectionCentre.ToString("F0"),
+            $"priority={priority:F2} turn={ClassifyTurnName(chosenArc)}",
+            priority);
+
         RefreshYieldDecision();
     }
 
@@ -228,42 +233,70 @@ public class IntersectionPrioritySystem : IVehicleBehaviour
         return 1f;                      // left turn  — lowest priority
     }
 
+    // Returns readable turn name for CSV logging
+    string ClassifyTurnName(TrafficPath arc)
+    {
+        float s = ClassifyTurn(arc);
+        return s >= 3f ? "straight" : s >= 2f ? "right" : "left";
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Conflict detection
     // ─────────────────────────────────────────────────────────────────────────
 
-    void RefreshYieldDecision()
+    public void RefreshYieldDecision()
     {
         if (!isRegistered) return;
         var entries = IntersectionRegistry.GetEntries(registeredAt);
         if (entries == null || entries.Count <= 1) { ShouldYieldAtEntry = false; return; }
 
-        // Find my own entry
         IntersectionRegistry.IntersectionEntry? myEntry = null;
         foreach (var e in entries)
             if (e.vehicle == owner) { myEntry = e; break; }
         if (myEntry == null) { ShouldYieldAtEntry = false; return; }
 
-        float myPriority = myEntry.Value.priority;
+        float myPriority  = myEntry.Value.priority;
+        bool  wasYielding = ShouldYieldAtEntry;
+        string yieldingTo = "";
+
         perception.Map.crossingPaths?.Clear();
         perception.Map.EnsureList();
         bool mustYield = false;
 
         foreach (var other in entries)
         {
-            if (other.vehicle == owner) continue;
-            if (other.vehicle == null)  continue;
-
-            // Check if this vehicle's arc actually conflicts with ours
+            if (other.vehicle == owner || other.vehicle == null) continue;
             if (!ArcsConflict(myEntry.Value.arcMidpoint, other.arcMidpoint)) continue;
 
-            // Add to crossing paths regardless — NeighbourMap awareness
             perception.Map.crossingPaths.Add(other.vehicle);
 
-            // If the other has higher priority, we yield
+            // Log every detected crossing conflict (fires once per conflict pair)
+            ctx.Log("CROSSING_CONFLICT",
+                other.vehicle.GetVehicleId(),
+                registeredAt.ToString("F0"),
+                $"me={myPriority:F2} other={other.priority:F2}",
+                myPriority);
+
             if (other.priority > myPriority)
-                mustYield = true;
+            {
+                mustYield  = true;
+                yieldingTo = other.vehicle.GetVehicleId();
+            }
         }
+
+        // Log transitions only — not every tick
+        if (mustYield && !wasYielding)
+            ctx.Log("INTERSECTION_YIELD",
+                yieldingTo,
+                registeredAt.ToString("F0"),
+                $"myPriority={myPriority:F2}",
+                myPriority);
+        else if (!mustYield && wasYielding)
+            ctx.Log("INTERSECTION_ENTER",
+                "",
+                registeredAt.ToString("F0"),
+                "cleared_to_enter",
+                myPriority);
 
         ShouldYieldAtEntry = mustYield;
     }
@@ -281,14 +314,15 @@ public class IntersectionPrioritySystem : IVehicleBehaviour
 
     void NotifyWaitersWeCleated()
     {
-        // When we clear, refresh every vehicle registered at this intersection
-        // so they re-evaluate whether they can now enter
+        ctx.Log("INTERSECTION_CLEARED", "", registeredAt.ToString("F0"), "arc_complete");
+
         var entries = IntersectionRegistry.GetEntries(registeredAt);
         if (entries == null) return;
         foreach (var e in entries)
         {
             if (e.vehicle == null || e.vehicle == owner) continue;
-            e.vehicle.intersectionPriority?.RefreshYieldDecision();
+            // Use public property — intersectionPriority field is private
+            e.vehicle.IntersectionPriority?.RefreshYieldDecision();
         }
     }
 

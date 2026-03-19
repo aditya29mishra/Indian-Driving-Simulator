@@ -2,38 +2,37 @@ using System.Collections.Generic;
 using UnityEngine;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TrafficSignal — signal group cycling, per-lane state lookup, yellow/red phase timing
+// TrafficSignal — signal group cycling, per-lane state lookup, phase timing.
 //
-// Cycles through signal groups with green/yellow/red phases. Provides per-lane
-// signal state lookups for vehicles. Builds lane-to-group dictionary in Awake
-// to ensure availability before other scripts initialize.
+// Auto lane assignment: assign a TrafficIntersectionNode and click
+// "Auto Assign Lanes From Node". Reads connectedRoads, groups forward lanes
+// into signal phases based on intersection type.
 //
-// Talks to: TrafficVehicle (provides GetStateForLane), TrafficLane (lane references)
+//   FourWay  → 2 phases: opposing road pairs share a green
+//   ThreeWay → 2 phases: most coaxial pair = main road, third = side
+//   TwoWay   → 1 phase: all lanes green together
+//
+// Talks to: TrafficVehicle, TrafficLane, TrafficIntersectionNode
 // ─────────────────────────────────────────────────────────────────────────────
 
 public class TrafficSignal : MonoBehaviour
 {
-    /// <summary>Possible states of a traffic signal.</summary>
     public enum SignalState { Green, Yellow, Red }
+    public enum TurnType    { Straight, Left, Right, All }
 
-    /// <summary>Types of turns a signal group can control.</summary>
-    public enum TurnType { Straight, Left, Right, All }
-
-    /// <summary>Represents a group of lanes controlled by the same signal phase.</summary>
     [System.Serializable]
     public class SignalGroup
     {
-        /// <summary>Name of the signal group.</summary>
-        public string groupName = "Group";
-        /// <summary>Type of turns this group controls.</summary>
-        public TurnType turnType = TurnType.All;
-        /// <summary>List of lanes in this group.</summary>
-        public List<TrafficLane> lanes = new List<TrafficLane>();
-
-        [HideInInspector] 
-        /// <summary>Current state of this signal group.</summary>
+        public string            groupName = "Group";
+        public TurnType          turnType  = TurnType.All;
+        public List<TrafficLane> lanes     = new List<TrafficLane>();
+        [HideInInspector]
         public SignalState state = SignalState.Red;
     }
+
+    [Header("Auto Lane Assignment")]
+    [Tooltip("The TrafficIntersectionNode whose approach roads are auto-grouped into phases.")]
+    public TrafficIntersectionNode intersectionNode;
 
     [Header("Signal Groups")]
     public List<SignalGroup> groups = new List<SignalGroup>();
@@ -46,22 +45,171 @@ public class TrafficSignal : MonoBehaviour
     [Header("Debug")]
     public bool showGizmos = true;
 
-    // Internal
-    private int   activeGroup  = 0;
-    private float phaseTimer   = 0f;
-    private bool  inYellow     = false;
-    private bool  inRedClear   = false;
+    private int   activeGroup = 0;
+    private float phaseTimer  = 0f;
+    private bool  inYellow    = false;
+    private bool  inRedClear  = false;
 
-    // Fast lookup: lane → group index
-    private Dictionary<TrafficLane, int> laneToGroup = new Dictionary<TrafficLane, int>();
+    private Dictionary<TrafficLane, int> laneToGroup        = new Dictionary<TrafficLane, int>();
+    private HashSet<TrafficLane>         missingLaneWarned  = new HashSet<TrafficLane>();
 
-    void Awake()
+    // ─────────────────────────────────────────────────────────────────────
+    // Auto assignment
+    // ─────────────────────────────────────────────────────────────────────
+
+    [ContextMenu("Auto Assign Lanes From Node")]
+    public void AutoAssignLanesFromNode()
     {
-        // Build lookup in Awake so it's ready before any other script's Start
-        // runs (e.g. VehicleSpawner.Start calls FindSignalForLane which needs
-        // the dictionary populated, and AssignLane reads GetStateForLane).
+        if (intersectionNode == null)
+        {
+            Debug.LogWarning("[TrafficSignal] intersectionNode not assigned.");
+            return;
+        }
+
+        var roads = intersectionNode.connectedRoads;
+        if (roads == null || roads.Count == 0)
+        {
+            Debug.LogWarning($"[TrafficSignal] '{intersectionNode.name}' has no connected roads.");
+            return;
+        }
+
+        groups.Clear();
+
+        switch (intersectionNode.intersectionType)
+        {
+            case TrafficIntersectionNode.IntersectionType.FourWay:
+            case TrafficIntersectionNode.IntersectionType.ThreeWay:
+                // One phase per road arm — sequential cycling, one direction green at a time
+                AutoAssignSequential(roads);
+                break;
+            case TrafficIntersectionNode.IntersectionType.TwoWay:
+                AutoAssignSinglePhase(roads);
+                break;
+        }
+
         BuildLookup();
+
+        int total = 0;
+        foreach (var g in groups) total += g.lanes.Count;
+        Debug.Log($"[TrafficSignal] '{name}': {groups.Count} groups, {total} lanes " +
+                  $"from '{intersectionNode.name}' ({intersectionNode.intersectionType}).");
     }
+
+    // ── Phase strategies ──────────────────────────────────────────────────
+
+    /// <summary>FourWay: find best opposing pair → Phase 0, remaining pair → Phase 1.</summary>
+    void AutoAssignOpposingPairs(List<TrafficRoad> roads)
+    {
+        if (roads.Count < 2) { AutoAssignSinglePhase(roads); return; }
+
+        int bestA = 0, bestB = 1;
+        float bestDot = float.MaxValue;
+        for (int i = 0; i < roads.Count; i++)
+            for (int j = i + 1; j < roads.Count; j++)
+            {
+                if (roads[i] == null || roads[j] == null) continue;
+                float dot = Vector3.Dot(
+                    RoadDirFromIntersection(roads[i]),
+                    RoadDirFromIntersection(roads[j]));
+                if (dot < bestDot) { bestDot = dot; bestA = i; bestB = j; }
+            }
+
+        var g0 = new SignalGroup { groupName = "Phase_0" };
+        AddForwardLanes(roads[bestA], g0);
+        AddForwardLanes(roads[bestB], g0);
+        groups.Add(g0);
+
+        var g1 = new SignalGroup { groupName = "Phase_1" };
+        for (int i = 0; i < roads.Count; i++)
+        {
+            if (i == bestA || i == bestB) continue;
+            AddForwardLanes(roads[i], g1);
+        }
+        if (g1.lanes.Count > 0) groups.Add(g1);
+    }
+
+    /// <summary>ThreeWay: most coaxial pair → Phase 0 (main), third road → Phase 1 (side).</summary>
+    void AutoAssignTJunction(List<TrafficRoad> roads)
+    {
+        if (roads.Count < 2) { AutoAssignSinglePhase(roads); return; }
+
+        int bestA = 0, bestB = 1;
+        float bestDot = float.MaxValue;
+        for (int i = 0; i < roads.Count; i++)
+            for (int j = i + 1; j < roads.Count; j++)
+            {
+                if (roads[i] == null || roads[j] == null) continue;
+                float dot = Vector3.Dot(
+                    RoadDirFromIntersection(roads[i]),
+                    RoadDirFromIntersection(roads[j]));
+                if (dot < bestDot) { bestDot = dot; bestA = i; bestB = j; }
+            }
+
+        var g0 = new SignalGroup { groupName = "Phase_0_Main" };
+        AddForwardLanes(roads[bestA], g0);
+        AddForwardLanes(roads[bestB], g0);
+        groups.Add(g0);
+
+        var g1 = new SignalGroup { groupName = "Phase_1_Side" };
+        for (int i = 0; i < roads.Count; i++)
+        {
+            if (i == bestA || i == bestB) continue;
+            AddForwardLanes(roads[i], g1);
+        }
+        if (g1.lanes.Count > 0) groups.Add(g1);
+    }
+
+    /// <summary>One group per road arm — fully sequential phases.</summary>
+    void AutoAssignSequential(List<TrafficRoad> roads)
+    {
+        for (int i = 0; i < roads.Count; i++)
+        {
+            if (roads[i] == null) continue;
+            var group = new SignalGroup { groupName = $"Phase_{i}_{roads[i].name}" };
+            AddForwardLanes(roads[i], group);
+            if (group.lanes.Count > 0) groups.Add(group);
+        }
+    }
+
+    /// <summary>TwoWay: all roads in one phase — both directions green together.</summary>
+    void AutoAssignSinglePhase(List<TrafficRoad> roads)
+    {
+        var g = new SignalGroup { groupName = "Phase_0_All" };
+        foreach (var road in roads)
+            AddForwardLanes(road, g);
+        if (g.lanes.Count > 0) groups.Add(g);
+    }
+
+    void AddForwardLanes(TrafficRoad road, SignalGroup group)
+    {
+        if (road == null) return;
+        foreach (var lane in road.lanes)
+            if (lane != null && lane.forwardDirection)
+                group.lanes.Add(lane);
+    }
+
+    /// <summary>Direction vector of this road arm pointing away from the intersection.</summary>
+    Vector3 RoadDirFromIntersection(TrafficRoad road)
+    {
+        if (road == null || intersectionNode == null) return Vector3.forward;
+        Vector3 nodePos = intersectionNode.transform.position;
+
+        if (road.startNode != null && road.endNode != null)
+        {
+            bool startIsNear = Vector3.Distance(road.startNode.transform.position, nodePos) <
+                               Vector3.Distance(road.endNode.transform.position,   nodePos);
+            Vector3 farEnd = startIsNear ? road.endNode.transform.position
+                                         : road.startNode.transform.position;
+            return (farEnd - nodePos).normalized;
+        }
+        return road.transform.forward;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Runtime
+    // ─────────────────────────────────────────────────────────────────────
+
+    void Awake()  { BuildLookup(); }
 
     void Start()
     {
@@ -78,94 +226,70 @@ public class TrafficSignal : MonoBehaviour
         laneToGroup.Clear();
         for (int g = 0; g < groups.Count; g++)
             foreach (var lane in groups[g].lanes)
-                if (lane != null)
-                    laneToGroup[lane] = g;
+                if (lane != null) laneToGroup[lane] = g;
     }
 
-    void SetAllRed()
-    {
-        foreach (var g in groups)
-            g.state = SignalState.Red;
-    }
+    void SetAllRed() { foreach (var g in groups) g.state = SignalState.Red; }
 
     void Update()
     {
         if (groups.Count == 0) return;
-
         phaseTimer -= Time.deltaTime;
-
         if (phaseTimer > 0f) return;
 
         if (!inYellow && !inRedClear)
         {
-            // Green expired — go yellow
             groups[activeGroup].state = SignalState.Yellow;
-            inYellow  = true;
-            phaseTimer = yellowTime;
+            inYellow = true; phaseTimer = yellowTime;
         }
         else if (inYellow)
         {
-            // Yellow expired — go red, start red clear
             groups[activeGroup].state = SignalState.Red;
-            inYellow   = false;
-            inRedClear = true;
-            phaseTimer  = redTime;
+            inYellow = false; inRedClear = true; phaseTimer = redTime;
         }
         else if (inRedClear)
         {
-            // Red clear expired — advance to next group
-            inRedClear = false;
+            inRedClear  = false;
             activeGroup = (activeGroup + 1) % groups.Count;
             groups[activeGroup].state = SignalState.Green;
-            phaseTimer = greenTime;
+            phaseTimer  = greenTime;
         }
     }
 
-    /// <summary>Forces the signal to advance to the next phase immediately.</summary>
+    // ─────────────────────────────────────────────────────────────────────
+    // Public API
+    // ─────────────────────────────────────────────────────────────────────
+
     public void ForceNextPhase()
     {
         if (groups.Count == 0) return;
         groups[activeGroup].state = SignalState.Red;
-        inYellow   = false;
-        inRedClear = false;
+        inYellow = false; inRedClear = false;
         activeGroup = (activeGroup + 1) % groups.Count;
         groups[activeGroup].state = SignalState.Green;
         phaseTimer = greenTime;
     }
 
-    /// <summary>Gets the current signal state for the specified lane.</summary>
-    /// <param name="lane">The lane to check.</param>
-    /// <returns>The signal state for the lane.</returns>
     public SignalState GetStateForLane(TrafficLane lane)
     {
         if (lane == null) return SignalState.Green;
         if (laneToGroup.TryGetValue(lane, out int g)) return groups[g].state;
 
-        // Lane not registered in any group — this is a setup error, not intentional.
-        // Log once so it shows in the console without spamming every frame.
         if (!missingLaneWarned.Contains(lane))
         {
             missingLaneWarned.Add(lane);
-            Debug.LogWarning($"[TrafficSignal] Lane '{lane.name}' is not in any SignalGroup on '{name}'. " +
-                             $"It will always read Green. Check your signal group setup.", this);
+            Debug.LogWarning($"[TrafficSignal] Lane '{lane.name}' not in any SignalGroup on '{name}'. " +
+                             "Run Auto Assign Lanes From Node.", this);
         }
         return SignalState.Green;
     }
 
-    private readonly HashSet<TrafficLane> missingLaneWarned = new HashSet<TrafficLane>();
-
-    /// <summary>Checks if the specified lane's signal group is currently active (green or yellow).</summary>
-    /// <param name="lane">The lane to check.</param>
-    /// <returns>True if the lane is active.</returns>
     public bool IsLaneActive(TrafficLane lane)
     {
-        SignalState s = GetStateForLane(lane);
+        var s = GetStateForLane(lane);
         return s == SignalState.Green || s == SignalState.Yellow;
     }
 
-    /// <summary>Gets the time remaining in the current phase for the specified lane.</summary>
-    /// <param name="lane">The lane to check.</param>
-    /// <returns>Time remaining in seconds.</returns>
     public float TimeRemainingForLane(TrafficLane lane)
     {
         if (lane == null) return 0f;
@@ -173,13 +297,15 @@ public class TrafficSignal : MonoBehaviour
         return g == activeGroup ? phaseTimer : 0f;
     }
 
-    /// <summary>Rebuilds the lane-to-group lookup dictionary.</summary>
     public void RefreshLookup() => BuildLookup();
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Gizmos
+    // ─────────────────────────────────────────────────────────────────────
 
     void OnDrawGizmos()
     {
         if (!showGizmos) return;
-
         foreach (var group in groups)
         {
             Color c = group.state == SignalState.Green  ? Color.green
@@ -188,17 +314,15 @@ public class TrafficSignal : MonoBehaviour
 
             foreach (var lane in group.lanes)
             {
-                if (lane == null || lane.path == null || lane.path.waypoints.Count == 0) continue;
-
-                // Draw a colored sphere at the lane end (stop line position)
-                Transform lastWP = lane.path.waypoints[lane.path.waypoints.Count - 1];
+                if (lane?.path == null || lane.path.waypoints.Count == 0) continue;
+                var lastWP = lane.path.waypoints[lane.path.waypoints.Count - 1];
                 Gizmos.color = c;
                 Gizmos.DrawSphere(lastWP.position + Vector3.up * 0.5f, 1.0f);
 
-                // Draw a line from stop line back 8m to show braking zone
                 if (lane.path.waypoints.Count > 1)
                 {
-                    Vector3 dir = (lastWP.position - lane.path.waypoints[lane.path.waypoints.Count - 2].position).normalized;
+                    Vector3 dir = (lastWP.position -
+                        lane.path.waypoints[lane.path.waypoints.Count - 2].position).normalized;
                     Gizmos.color = new Color(c.r, c.g, c.b, 0.3f);
                     Gizmos.DrawLine(lastWP.position, lastWP.position - dir * 8f);
                 }

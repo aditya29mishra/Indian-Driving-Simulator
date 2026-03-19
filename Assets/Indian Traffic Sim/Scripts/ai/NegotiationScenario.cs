@@ -131,8 +131,18 @@ public class LaneChangeScenario : NegotiationScenario
         bool slow    = ctx.CurrentSpeed < ctx.DesiredSpeedMs * 0.8f;
         if (!blocked && !slow) return;
 
-        float gL = ctx.LeftLane  != null ? GapInLane(ctx.LeftLane,  signalYield: true) : -1f;
-        float gR = ctx.RightLane != null ? GapInLane(ctx.RightLane, signalYield: true) : -1f;
+        // Use NeighbourMap to check if adjacent lanes are safe BEFORE computing gap.
+        // Without this: a vehicle would change lanes into a car directly beside it (sideswipe).
+        // besideLeft/Right = car level with us → immediate collision if we move laterally.
+        // rearLeft/Right   = car behind us closing fast → rear-end if we slow during change.
+        var map = owner.Perception?.Map;
+        bool leftSafe  = map == null || (!map.HasAnythingBesideLeft  &&
+                         (map.rearLeft  == null || IsRearGapSafe(map.rearLeft)));
+        bool rightSafe = map == null || (!map.HasAnythingBesideRight &&
+                         (map.rearRight == null || IsRearGapSafe(map.rearRight)));
+
+        float gL = (ctx.LeftLane  != null && leftSafe)  ? GapInLane(ctx.LeftLane,  signalYield: true) : -1f;
+        float gR = (ctx.RightLane != null && rightSafe) ? GapInLane(ctx.RightLane, signalYield: true) : -1f;
 
         if      (gL > 0f && gR > 0f) targetLane = gL >= gR ? ctx.LeftLane : ctx.RightLane;
         else if (gL > 0f)             targetLane = ctx.LeftLane;

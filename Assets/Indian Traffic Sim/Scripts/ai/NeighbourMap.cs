@@ -147,25 +147,45 @@ public class PerceptionSystem : IVehicleBehaviour
             float dist = toOther.magnitude;
             if (dist < 0.3f) continue;
 
-            // Dot product against ego forward classifies the zone:
-            //  +1 = directly ahead, 0 = beside, -1 = directly behind
             float dot = Vector3.Dot(ctx.Transform.forward, toOther.normalized);
 
-            if (dot > 0.4f) // front zone: ~66° forward cone
+            if (dot > 0.4f)
             {
                 if (dist < distFront) { distFront = dist; closestFront = other; }
             }
-            else if (dot < -0.4f) // rear zone: ~66° rear cone
+            else if (dot < -0.4f)
             {
                 if (dist < distRear) { distRear = dist; closestRear = other; }
             }
-            else // beside zone: the ±40° lateral band
+            else
             {
                 if (dist < distBeside) { distBeside = dist; closestBeside = other; }
             }
         }
 
-        // Write into the correct side of the map
+        // ── Log collision risks ──────────────────────────────────────────
+        // Beside: any vehicle level with us is a sideswipe risk during lane change
+        if (closestBeside != null && distBeside < ctx.VehicleLength * 2f)
+        {
+            ctx.Log("COLLISION_RISK",
+                closestBeside.GetVehicleId(),
+                isLeft ? "beside_left" : "beside_right",
+                $"dist={distBeside:F1}");
+        }
+
+        // Rear: vehicle behind us that is closing faster than our speed
+        if (closestRear != null)
+        {
+            float closingSpeed = closestRear.CurrentSpeed - ctx.CurrentSpeed;
+            if (closingSpeed > 2f && distRear < closingSpeed * ctx.TimeHeadway * 2f)
+            {
+                ctx.Log("COLLISION_RISK",
+                    closestRear.GetVehicleId(),
+                    isLeft ? "rear_left" : "rear_right",
+                    $"dist={distRear:F1} closing={closingSpeed:F1}");
+            }
+        }
+
         if (isLeft)
         {
             Map.frontLeft  = closestFront;
