@@ -777,7 +777,6 @@ MonoBehaviour:
   - {fileID: 1659531230610606, guid: 9dd210df7ae90ac4fbc6f409c42ae19c, type: 3}
   - {fileID: 1914277793220710, guid: 3450c4fc47fee8f48b69dfc5786c49d4, type: 3}
   - {fileID: 1050598374673532, guid: 27a9dd3c50ccc404e971f46002050db2, type: 3}
-  - {fileID: 1113616122087072, guid: e5980ace65db22a4c926bec65e89c21c, type: 3}
   - {fileID: 1919964766702672, guid: 8c170b56918dbde43a55678db6f50211, type: 3}
   vehicleWeights:
   - 25
@@ -797,10 +796,10 @@ MonoBehaviour:
   - 96
   - 25
   - 58
-  maxVehiclesTotal: 40
-  maxVehiclesPerLane: 8
+  maxVehiclesTotal: 200
+  maxVehiclesPerLane: 20
   spawnInterval: 0.5
-  spawnClearDistance: 8
+  spawnClearDistance: 4
   laneManager: {fileID: 32611876}
   trafficSignals:
   - {fileID: 32611875}
@@ -5480,7 +5479,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   recordInterval: 0.1
-  maxFrames: 50000
+  maxFrames: 100000
   recordOnStart: 1
 --- !u!1 &253162015
 GameObject:
