@@ -32,8 +32,8 @@ public class VehicleNavigator : IVehicleBehaviour
 
     public void Tick(float dt)
     {
-        ctx.InsideIntersection = (ctx.CurrentPath != null && ctx.CurrentLane != null &&
-                                   ctx.CurrentPath != ctx.CurrentLane.path);
+        // Arc lanes have road == null — that's how we know we're in an intersection
+        ctx.InsideIntersection = ctx.CurrentLane != null && ctx.CurrentLane.road == null;
 
         if (ctx.CurrentPath == null || ctx.CurrentPath.waypoints.Count == 0) return;
 
@@ -53,10 +53,11 @@ public class VehicleNavigator : IVehicleBehaviour
     {
         ctx.CurrentLane       = lane;
         ctx.CurrentPath       = lane.path;
-        ctx.DistanceTravelled = fromSpawn ? 0f
-            : (ctx.CurrentPath != null
-               ? ctx.CurrentPath.GetClosestDistance(ctx.Transform.position)
-               : 0f);
+        // Always start at 0 — avoids snapping issues when transitioning
+        // between road path → arc lane → exit road lane.
+        // GetClosestDistance can return a high value if the car isn't yet
+        // physically at waypoints[0], causing immediate re-advance and despawn.
+        ctx.DistanceTravelled = 0f;
         ctx.IsWaitingForLane  = false;
 
         if (lane.road != null && lane.road.speedLimit > 0f)
@@ -85,129 +86,82 @@ public class VehicleNavigator : IVehicleBehaviour
     {
         if (ctx.CurrentLane == null) { ctx.Log("FAIL_NO_LANE"); Despawn(); return; }
 
-        bool isTurnPath = ctx.CurrentPath != ctx.CurrentLane.path;
+        // All connections are now via nextLanes — road lanes, arc lanes, joint lanes.
+        // Arc lanes are created by IntersectionConnector and wired:
+        //   road lane → arc lane → exit road lane
+        // No isTurnPath check needed — just follow nextLanes always.
 
-        // 1. Finishing a turn arc → snap back to the target lane's main path
-        if (isTurnPath)
+        if (ctx.CurrentLane.nextLanes != null && ctx.CurrentLane.nextLanes.Count > 0)
         {
-            ctx.Log("TURN_COMPLETE", ctx.CurrentLane.name);
-            AssignLane(ctx.CurrentLane);
-            return;
-        }
+            TrafficLane next = ChooseNextLane();
 
-        // 2. Lane has intersection turn paths → pick one via graph routing
-        if (ctx.CurrentLane.nextPaths != null && ctx.CurrentLane.nextPaths.Count > 0)
-        {
-            var lp = ChooseTurnPath();
-
-            if (lp == null || lp.path == null || lp.targetLane == null)
+            if (next == null)
             {
-                ctx.Log("FAIL_TURN_SELECTION", ctx.CurrentLane.name);
-
-                if (ctx.CurrentLane.nextLanes != null && ctx.CurrentLane.nextLanes.Count > 0)
-                {
-                    var fallback = ctx.CurrentLane.nextLanes[Random.Range(0, ctx.CurrentLane.nextLanes.Count)];
-                    ctx.Log("FALLBACK_LANE", fallback.name);
-                    AssignLane(fallback);
-                    return;
-                }
-
-                ctx.Log("ARRIVED_TERMINAL", ctx.CurrentLane.name,
-                    ctx.DestNode != null ? ctx.DestNode.name : "terminal");
+                ctx.Log("FAIL_LANE_SELECTION", ctx.CurrentLane.name);
                 Despawn();
                 return;
             }
 
-            ctx.Log("PATH_SWITCH", lp.path.name, GetIntersectionId());
-
-            if (ctx.IntersectionPriority != null && lp.path != null)
+            // Notify intersection priority system if entering an arc lane
+            if (ctx.IntersectionPriority != null && next.road == null)
             {
                 Vector3 intersectionCentre =
                     ctx.CurrentLane.path != null && ctx.CurrentLane.path.waypoints.Count > 0
                     ? ctx.CurrentLane.path.waypoints[ctx.CurrentLane.path.waypoints.Count - 1].position
                     : ctx.Transform.position;
-                ctx.IntersectionPriority.OnTurnCommitted(lp.path, intersectionCentre);
+                ctx.IntersectionPriority.OnTurnCommitted(next.path, intersectionCentre);
             }
 
-            ctx.RouteHistory.Add("P:" + lp.path.name);
-            ctx.CurrentPath       = lp.path;
-            ctx.CurrentLane       = lp.targetLane;
-            ctx.DistanceTravelled = ctx.CurrentPath.GetClosestDistance(ctx.Transform.position);
-            ctx.LaneManager?.RefreshVehicle(owner);
-            return;
-        }
-
-        // 3. Straight connections via nextLanes
-        if (ctx.CurrentLane.nextLanes != null && ctx.CurrentLane.nextLanes.Count > 0)
-        {
-            var next = ctx.CurrentLane.nextLanes[Random.Range(0, ctx.CurrentLane.nextLanes.Count)];
-            ctx.Log("LANE_CONTINUE", next.name);
-            ctx.RouteHistory.Add("FALLBACK:" + next.name);
+            ctx.Log("LANE_ADVANCE", next.name);
             AssignLane(next);
             return;
         }
 
-        // 4. Terminal lane — no exits
+        // No exits — terminal lane
         ctx.Log("ARRIVED_TERMINAL", ctx.CurrentLane?.name ?? "none",
             ctx.DestNode != null ? ctx.DestNode.name : "terminal");
         Despawn();
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Turn selection — informed reactive routing via TrafficGraph
+    // Lane selection — informed reactive routing via TrafficGraph
     // ─────────────────────────────────────────────────────────────────────
-    //
-    // The vehicle asks TrafficGraph: given my current road's End node and
-    // my destination node, what is the next node to head toward?
-    // Then picks the turn arc whose target road contains that node.
-    //
-    // Fallback chain (if graph unavailable or returns no path):
-    //   1. Straight-ahead preference (best dot product)
-    //   2. First valid path (last resort)
-    //
-    // This matches how a real driver thinks — informed decision at each
-    // junction, no pre-planned full route stored on the vehicle.
 
-    TrafficLane.LanePath ChooseTurnPath()
+    TrafficLane ChooseNextLane()
     {
-        var paths = ctx.CurrentLane.nextPaths;
-        if (paths == null || paths.Count == 0) return null;
+        var candidates = ctx.CurrentLane.nextLanes;
+        if (candidates == null || candidates.Count == 0) return null;
 
-        // Collect valid candidates
-        var valid = new System.Collections.Generic.List<TrafficLane.LanePath>();
-        foreach (var lp in paths)
-            if (lp != null && lp.path != null && lp.targetLane != null)
-                valid.Add(lp);
+        // Filter valid
+        var valid = new System.Collections.Generic.List<TrafficLane>();
+        foreach (var l in candidates)
+            if (l != null && l.path != null) valid.Add(l);
 
         if (valid.Count == 0) return null;
-        if (valid.Count == 1)
-        {
-            ctx.Recorder?.LogEvent(ctx.VehicleId, "TURN_DECISION",
-                valid[0].path.name, GetIntersectionId(), "only_option", 1f, ctx.GetRouteTrace());
-            return valid[0];
-        }
+        if (valid.Count == 1) return valid[0];
 
         // ── Graph-based routing ───────────────────────────────────────────
+        // Only applied when choosing between arc lanes (at an intersection).
+        // Arc lanes connect to exit road lanes — find the one whose exit road
+        // contains the next node from Dijkstra.
         if (ctx.DestNode != null && TrafficGraph.Instance != null)
         {
-            // Find the End node of the current road — that's "where we are" in graph terms
             TrafficRoadNode currentEndNode = GetCurrentRoadEndNode();
 
             if (currentEndNode != null)
             {
-                // Ask the graph: what is the next node to head toward?
                 TrafficRoadNode nextNode = TrafficGraph.Instance.GetNextNode(
                     currentEndNode, ctx.DestNode);
 
                 if (nextNode != null)
                 {
-                    // Find the turn arc whose target lane's road contains nextNode
-                    TrafficLane.LanePath best = FindPathTowardNode(valid, nextNode);
-
+                    // Each arc lane has exactly one nextLane — the exit road lane.
+                    // Find the arc lane whose exit road lane belongs to the target road.
+                    TrafficLane best = FindLaneTowardNode(valid, nextNode);
                     if (best != null)
                     {
-                        ctx.Recorder?.LogEvent(ctx.VehicleId, "TURN_DECISION",
-                            best.path.name, GetIntersectionId(),
+                        ctx.Recorder?.LogEvent(ctx.VehicleId, "LANE_DECISION",
+                            best.name, GetIntersectionId(),
                             $"graph_route→{nextNode.name}", 1f, ctx.GetRouteTrace());
                         return best;
                     }
@@ -216,19 +170,13 @@ public class VehicleNavigator : IVehicleBehaviour
         }
 
         // ── Fallback: straight-ahead preference ───────────────────────────
-        TrafficLane.LanePath straightest = null;
+        TrafficLane straightest = null;
         float bestDot = -1f;
-
-        foreach (var lp in valid)
+        foreach (var l in valid)
         {
-            float dot = Vector3.Dot(ctx.Transform.forward, lp.targetLane.transform.forward);
-            if (dot > bestDot) { bestDot = dot; straightest = lp; }
+            float dot = Vector3.Dot(ctx.Transform.forward, l.transform.forward);
+            if (dot > bestDot) { bestDot = dot; straightest = l; }
         }
-
-        if (straightest != null)
-            ctx.Recorder?.LogEvent(ctx.VehicleId, "TURN_DECISION",
-                straightest.path.name, GetIntersectionId(),
-                "straight_fallback", 1f, ctx.GetRouteTrace());
 
         return straightest ?? valid[0];
     }
@@ -238,19 +186,22 @@ public class VehicleNavigator : IVehicleBehaviour
     // ─────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Finds the turn arc in the candidate list whose target road contains
-    /// the given node (as startNode or endNode).
+    /// Finds the arc lane (in nextLanes) that leads toward the target node.
+    /// Arc lanes have nextLanes[0] = exit road lane. Check that exit road lane's
+    /// road for the target node.
     /// </summary>
-    TrafficLane.LanePath FindPathTowardNode(
-        System.Collections.Generic.List<TrafficLane.LanePath> candidates,
+    TrafficLane FindLaneTowardNode(
+        System.Collections.Generic.List<TrafficLane> candidates,
         TrafficRoadNode targetNode)
     {
-        foreach (var lp in candidates)
+        foreach (var arcLane in candidates)
         {
-            TrafficRoad road = lp.targetLane?.road;
-            if (road == null) continue;
-            if (road.startNode == targetNode || road.endNode == targetNode)
-                return lp;
+            // Arc lane → exit road lane
+            if (arcLane.nextLanes == null || arcLane.nextLanes.Count == 0) continue;
+            TrafficRoad exitRoad = arcLane.nextLanes[0]?.road;
+            if (exitRoad == null) continue;
+            if (exitRoad.startNode == targetNode || exitRoad.endNode == targetNode)
+                return arcLane;
         }
         return null;
     }
@@ -262,7 +213,15 @@ public class VehicleNavigator : IVehicleBehaviour
     /// </summary>
     TrafficRoadNode GetCurrentRoadEndNode()
     {
+        // If on arc lane (road == null), look at the arc's exit road via nextLanes
         TrafficRoad road = ctx.CurrentLane?.road;
+        if (road == null)
+        {
+            // Arc lane — get exit road from nextLanes[0]
+            var exitLane = ctx.CurrentLane?.nextLanes?.Count > 0
+                ? ctx.CurrentLane.nextLanes[0] : null;
+            road = exitLane?.road;
+        }
         if (road == null) return null;
 
         if (road.startNode != null &&

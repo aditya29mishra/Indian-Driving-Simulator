@@ -64,6 +64,8 @@ public partial class TrafficVehicle : MonoBehaviour
     public bool  IsChangingLane    => ctx != null && ctx.LaneChangeCooldown > 0f && !ctx.InsideIntersection;
     public float LaneChangeProgress=> ctx != null ? Mathf.Clamp01(1f - ctx.LaneChangeCooldown / 5f) : 0f;
     public bool  IsInsideIntersection => ctx?.InsideIntersection ?? false;
+    // VehicleMap — local minimap populated by WorldPerception each tick
+    public VehicleMap Map => ctx?.Map;
     public PerceptionSystem           Perception           => perception;
     public IntersectionPrioritySystem IntersectionPriority => intersectionPriority;
     public DestinationSystem          Destination          => destination;

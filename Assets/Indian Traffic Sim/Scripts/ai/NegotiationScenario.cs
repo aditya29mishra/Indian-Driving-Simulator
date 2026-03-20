@@ -98,6 +98,8 @@ public class LaneChangeScenario : NegotiationScenario
 {
     private TrafficLane targetLane;
     private TrafficVehicle.ManeuverState direction;
+    private bool isOvertake;        // true when changing lane to pass a slower car
+    private bool isOvertakeReturn;  // true when moving back to right after passing
     private readonly VehicleIDM idm;
     private readonly VehicleNavigator navigator;
 
@@ -110,52 +112,115 @@ public class LaneChangeScenario : NegotiationScenario
 
     public override void Evaluate()
     {
-        IsActive   = false;
-        targetLane = null;
+        IsActive        = false;
+        targetLane      = null;
+        isOvertake      = false;
+        isOvertakeReturn = false;
 
-        if (ctx.InsideIntersection || ctx.LaneChangeCooldown > 0f) return;
-        if (ctx.CurrentPath == null || ctx.CurrentLane == null) return;
-        if (ctx.CurrentPath != ctx.CurrentLane.path) return;
-        if (ctx.CurrentLane.path == null) return;
+        // ── Guards ────────────────────────────────────────────────────────
+        if (ctx.InsideIntersection)         return;
+        if (ctx.LaneChangeCooldown > 0f)    return;
+        if (ctx.OvertakeCooldown > 0f)      return;
+        if (ctx.CurrentLane == null)        return;
+        if (ctx.CurrentLane.road == null)   return;  // arc lane — no change
+        if (ctx.CurrentLane.path == null)   return;
         if (ctx.CurrentLane.path.TotalLength - ctx.DistanceTravelled < 45f) return;
-        if (ctx.CurrentSpeed < 0.5f) return;
-        if (idm.MustStopForSignal()) return;
+        if (ctx.CurrentSpeed < 0.5f)        return;
+        if (idm.MustStopForSignal())        return;
 
-        // Don't change around a car stopped for red
-        if (ctx.LeaderVehicle != null && ctx.LeaderVehicle.CurrentSpeed < 0.1f
-            && ctx.LeaderVehicle.currentSignal != null
-            && ctx.LeaderVehicle.currentSignal.GetStateForLane(ctx.LeaderVehicle.currentLane)
-               != TrafficSignal.SignalState.Green) return;
+        var map = ctx.Map;
 
-        bool blocked = ctx.LeaderVehicle != null && ctx.LeaderVehicle.CurrentSpeed < ctx.CurrentSpeed * 0.8f;
-        bool slow    = ctx.CurrentSpeed < ctx.DesiredSpeedMs * 0.8f;
+        // ── Overtake return check ─────────────────────────────────────────
+        // We are in the left lane after an overtake. Check if we have passed the
+        // slow car and the right lane is now clear to move back.
+        // Only applies when OvertakeCooldown is counting down (we recently overtook).
+        if (ctx.OvertakeCooldown > 0f && ctx.RightLane != null &&
+            ctx.CurrentLane == ctx.LeftLane)
+        {
+            // Passed the slow car = FrontClose is now clear or moving fast
+            var fcReturn = map?[MapZone.FrontClose];
+            bool passedSlowCar = fcReturn == null ||
+                                 fcReturn.vehicle == null ||
+                                 fcReturn.vehicle.CurrentSpeed >= ctx.BaseSpeedMs * 0.85f;
+
+            // Right lane must be clear beside and rear
+            bool rightReturnClear = !map.HasVehicle(MapZone.BesideRight) &&
+                                    !IsClosingFast(map[MapZone.RearRight]) &&
+                                    IsFrontGapEnough(map[MapZone.FrontRight]);
+
+            if (passedSlowCar && rightReturnClear)
+            {
+                targetLane       = ctx.RightLane;
+                direction        = TrafficVehicle.ManeuverState.LaneChangeRight;
+                isOvertakeReturn = true;
+                IsActive         = true;
+                return;
+            }
+        }
+
+        // ── Blocked / slow check — read from VehicleMap ───────────────────
+        var frontCell = map?[MapZone.FrontClose];
+        TrafficVehicle frontVehicle = frontCell?.vehicle;
+
+        // Don't change if front car is stopped at red
+        if (frontVehicle != null && frontVehicle.CurrentSpeed < 0.1f &&
+            frontVehicle.currentSignal != null &&
+            frontVehicle.currentSignal.GetStateForLane(frontVehicle.currentLane)
+                != TrafficSignal.SignalState.Green) return;
+
+        // Blocked = front car significantly slower than us
+        bool blocked = frontVehicle != null &&
+                       frontVehicle.CurrentSpeed < ctx.CurrentSpeed * 0.75f;
+
+        // Slow = we are running below our desired speed
+        bool slow = ctx.CurrentSpeed < ctx.DesiredSpeedMs * 0.75f;
+
         if (!blocked && !slow) return;
 
-        // Use NeighbourMap to check if adjacent lanes are safe BEFORE computing gap.
-        // Without this: a vehicle would change lanes into a car directly beside it (sideswipe).
-        // besideLeft/Right = car level with us → immediate collision if we move laterally.
-        // rearLeft/Right   = car behind us closing fast → rear-end if we slow during change.
-        var map = owner.Perception?.Map;
-        bool leftSafe  = map == null || (!map.HasAnythingBesideLeft  &&
-                         (map.rearLeft  == null || IsRearGapSafe(map.rearLeft)));
-        bool rightSafe = map == null || (!map.HasAnythingBesideRight &&
-                         (map.rearRight == null || IsRearGapSafe(map.rearRight)));
+        // ── Safety check — read directly from VehicleMap ──────────────────
+        // BesideLeft/Right: car level with us → sideswipe if we move now
+        // RearLeft/Right:   car closing from behind → rear-end during change
+        // FrontLeft/Right:  car ahead in target lane → not enough gap
+        bool leftClear  = map == null ||
+                          (!map.HasVehicle(MapZone.BesideLeft) &&
+                           !IsClosingFast(map[MapZone.RearLeft]) &&
+                           IsFrontGapEnough(map[MapZone.FrontLeft]));
 
-        float gL = (ctx.LeftLane  != null && leftSafe)  ? GapInLane(ctx.LeftLane,  signalYield: true) : -1f;
-        float gR = (ctx.RightLane != null && rightSafe) ? GapInLane(ctx.RightLane, signalYield: true) : -1f;
+        bool rightClear = map == null ||
+                          (!map.HasVehicle(MapZone.BesideRight) &&
+                           !IsClosingFast(map[MapZone.RearRight]) &&
+                           IsFrontGapEnough(map[MapZone.FrontRight]));
 
-        if      (gL > 0f && gR > 0f) targetLane = gL >= gR ? ctx.LeftLane : ctx.RightLane;
-        else if (gL > 0f)             targetLane = ctx.LeftLane;
-        else if (gR > 0f)             targetLane = ctx.RightLane;
+        // ── Lane selection — left-hand traffic ────────────────────────────
+        // In left-hand traffic, left lane = overtaking lane.
+        // Prefer left when blocked (overtake), prefer right when just slow (keep left free).
+        if (blocked)
+        {
+            // Overtake: try left first (overtaking lane), then right
+            if (ctx.LeftLane  != null && leftClear)  { targetLane = ctx.LeftLane;  isOvertake = true; }
+            else if (ctx.RightLane != null && rightClear) { targetLane = ctx.RightLane; isOvertake = true; }
+        }
+        else
+        {
+            // Just slow: try right first (keep left clear for faster cars)
+            if (ctx.RightLane != null && rightClear) { targetLane = ctx.RightLane; }
+            else if (ctx.LeftLane != null && leftClear)   { targetLane = ctx.LeftLane; }
+        }
 
         if (targetLane == null) return;
 
+        // ── Required gap check ────────────────────────────────────────────
+        // Gap in target lane must be at least minGap + speed-based buffer
         float reqGap = ctx.MinimumGap + ctx.CurrentSpeed * 1.2f;
-        float gap    = GapInLane(targetLane, signalYield: false);
-        if (gap < reqGap) { targetLane = null; return; }
+        MapZone frontZone = (targetLane == ctx.LeftLane) ? MapZone.FrontLeft : MapZone.FrontRight;
+        var frontTarget   = map?[frontZone];
+        float availGap    = frontTarget?.vehicle != null ? frontTarget.distance : 999f;
 
-        direction = (targetLane == ctx.LeftLane) ? TrafficVehicle.ManeuverState.LaneChangeLeft
-                                                 : TrafficVehicle.ManeuverState.LaneChangeRight;
+        if (availGap < reqGap) { targetLane = null; return; }
+
+        direction = (targetLane == ctx.LeftLane)
+            ? TrafficVehicle.ManeuverState.LaneChangeLeft
+            : TrafficVehicle.ManeuverState.LaneChangeRight;
         IsActive = true;
     }
 
@@ -172,8 +237,44 @@ public class LaneChangeScenario : NegotiationScenario
         ctx.RouteHistory.Add("LC:" + targetLane.name);
         ctx.Log("LANE_CHANGE", targetLane.path.name, "", direction.ToString(), ctx.CurrentSpeed);
 
-        IsActive   = false;
-        targetLane = null;
+        // If overtaking — activate speed boost so car accelerates past slower vehicle
+        if (isOvertake)
+        {
+            ctx.OvertakeBoostActive = true;
+            ctx.OvertakeCooldown    = 8f;
+        }
+
+        // If returning after overtake — clear boost, longer cooldown before next change
+        if (isOvertakeReturn)
+        {
+            ctx.OvertakeBoostActive = false;
+            ctx.OvertakeCooldown    = 0f;   // clear so normal lane logic resumes
+            ctx.LaneChangeCooldown  = 8f;   // longer cooldown after full overtake sequence
+        }
+
+        IsActive         = false;
+        targetLane       = null;
+        isOvertake       = false;
+        isOvertakeReturn = false;
+    }
+
+    // ── Safety helpers — read from VehicleMap ─────────────────────────────
+
+    /// <summary>True if the rear cell vehicle is closing fast enough to be dangerous.</summary>
+    bool IsClosingFast(MapCell rearCell)
+    {
+        if (rearCell?.vehicle == null) return false;
+        // relSpeed > 0 in rear zone means they are faster than us = closing
+        // Dangerous if closing AND within 1.5× headway distance
+        return rearCell.relSpeed > 1.5f &&
+               rearCell.distance < rearCell.relSpeed * ctx.TimeHeadway * 1.5f;
+    }
+
+    /// <summary>True if the front gap in the target lane is sufficient to merge.</summary>
+    bool IsFrontGapEnough(MapCell frontCell)
+    {
+        if (frontCell?.vehicle == null) return true; // empty — fine
+        return frontCell.distance > ctx.MinimumGap + ctx.CurrentSpeed * 1.0f;
     }
 }
 

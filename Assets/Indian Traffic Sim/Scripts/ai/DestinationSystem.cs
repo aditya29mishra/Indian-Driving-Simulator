@@ -60,28 +60,27 @@ public class DestinationSystem : IVehicleBehaviour
     void CheckDestinationArrival()
     {
         if (ctx.CurrentLane == null) return;
+
+        // Arc lanes have road == null — skip while in intersection
         if (ctx.CurrentLane.road == null) return;
 
-        // Don't check while physically on a turn arc.
-        // CurrentPath != CurrentLane.path means arc is in progress.
-        bool onArc = ctx.CurrentPath != null &&
-                     ctx.CurrentLane.path != null &&
-                     ctx.CurrentPath != ctx.CurrentLane.path;
-        if (onArc) return;
-
-        // Only despawn here on EXACT destination match.
-        // If the vehicle is on any other terminal lane (wrong arm), let it
-        // drive to the physical end of that lane first — AdvanceToNextPath
-        // branch 4 handles the terminal despawn when nearEnd fires.
-        // This way vehicles always drive to the road tip before vanishing,
-        // not disappear the instant they exit the intersection arc.
         if (ctx.DestNode == null) return;
 
         TrafficRoad road = ctx.CurrentLane.road;
-        if (road.startNode == ctx.DestNode || road.endNode == ctx.DestNode)
-        {
-            ArriveClean("ARRIVED");
-        }
+
+        // Check if this lane's road contains the destination End node
+        if (road.startNode != ctx.DestNode && road.endNode != ctx.DestNode) return;
+
+        // Don't despawn the instant we enter the road — wait until the car
+        // is physically close to the End node (within 8m).
+        // This prevents immediate despawn right after exiting an arc.
+        Vector3 destPos  = ctx.DestNode.transform.position;
+        Vector3 carPos   = ctx.Transform.position;
+        float   distToDest = Vector3.Distance(carPos, destPos);
+
+        if (distToDest > 8f) return;
+
+        ArriveClean("ARRIVED");
     }
 
     bool IsTerminalLane(TrafficLane lane)
@@ -152,4 +151,4 @@ public class DestinationSystem : IVehicleBehaviour
         }
     }
     
-}
+}   

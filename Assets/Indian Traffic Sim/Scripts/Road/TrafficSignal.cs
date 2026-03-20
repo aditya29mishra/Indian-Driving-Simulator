@@ -115,15 +115,15 @@ public class TrafficSignal : MonoBehaviour
             }
 
         var g0 = new SignalGroup { groupName = "Phase_0" };
-        AddForwardLanes(roads[bestA], g0);
-        AddForwardLanes(roads[bestB], g0);
+        AddArrivingLanes(roads[bestA], g0);
+        AddArrivingLanes(roads[bestB], g0);
         groups.Add(g0);
 
         var g1 = new SignalGroup { groupName = "Phase_1" };
         for (int i = 0; i < roads.Count; i++)
         {
             if (i == bestA || i == bestB) continue;
-            AddForwardLanes(roads[i], g1);
+            AddArrivingLanes(roads[i], g1);
         }
         if (g1.lanes.Count > 0) groups.Add(g1);
     }
@@ -146,15 +146,15 @@ public class TrafficSignal : MonoBehaviour
             }
 
         var g0 = new SignalGroup { groupName = "Phase_0_Main" };
-        AddForwardLanes(roads[bestA], g0);
-        AddForwardLanes(roads[bestB], g0);
+        AddArrivingLanes(roads[bestA], g0);
+        AddArrivingLanes(roads[bestB], g0);
         groups.Add(g0);
 
         var g1 = new SignalGroup { groupName = "Phase_1_Side" };
         for (int i = 0; i < roads.Count; i++)
         {
             if (i == bestA || i == bestB) continue;
-            AddForwardLanes(roads[i], g1);
+            AddArrivingLanes(roads[i], g1);
         }
         if (g1.lanes.Count > 0) groups.Add(g1);
     }
@@ -166,7 +166,7 @@ public class TrafficSignal : MonoBehaviour
         {
             if (roads[i] == null) continue;
             var group = new SignalGroup { groupName = $"Phase_{i}_{roads[i].name}" };
-            AddForwardLanes(roads[i], group);
+            AddArrivingLanes(roads[i], group);
             if (group.lanes.Count > 0) groups.Add(group);
         }
     }
@@ -176,16 +176,31 @@ public class TrafficSignal : MonoBehaviour
     {
         var g = new SignalGroup { groupName = "Phase_0_All" };
         foreach (var road in roads)
-            AddForwardLanes(road, g);
+            AddArrivingLanes(road, g);
         if (g.lanes.Count > 0) groups.Add(g);
     }
 
-    void AddForwardLanes(TrafficRoad road, SignalGroup group)
+    /// <summary>
+    /// Adds arriving lanes of this road to the signal group.
+    /// Arriving = waypoints[last] closer to intersection centre than waypoints[0].
+    /// Position-based — works regardless of forwardDirection or startNode/endNode swap.
+    /// </summary>
+    void AddArrivingLanes(TrafficRoad road, SignalGroup group)
     {
-        if (road == null) return;
+        if (road == null || intersectionNode == null) return;
+        Vector3 centre = intersectionNode.transform.position;
+
         foreach (var lane in road.lanes)
-            if (lane != null && lane.forwardDirection)
+        {
+            if (lane?.path == null || lane.path.waypoints == null ||
+                lane.path.waypoints.Count < 2) continue;
+
+            Vector3 wp0   = lane.path.waypoints[0].position;
+            Vector3 wpEnd = lane.path.waypoints[lane.path.waypoints.Count - 1].position;
+
+            if (Vector3.Distance(wpEnd, centre) < Vector3.Distance(wp0, centre))
                 group.lanes.Add(lane);
+        }
     }
 
     /// <summary>Direction vector of this road arm pointing away from the intersection.</summary>

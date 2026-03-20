@@ -120,10 +120,8 @@ public class TrafficRoad : MonoBehaviour
                 laneEnd     = tmp;
             }
 
-            string dir = isForward ? "F" : "B";
-
-            // Lane
-            var laneObj              = new GameObject($"Lane_{roadId}_{dir}_{groupIndex}");
+            // Lane — named by road name + lane index (no F/B direction tag)
+            var laneObj              = new GameObject($"Lane_{name}_{i}");
             laneObj.transform.parent = transform;
             var lane                 = laneObj.AddComponent<TrafficLane>();
             lane.laneIndex           = i;
@@ -132,7 +130,7 @@ public class TrafficRoad : MonoBehaviour
             lanes.Add(lane);
 
             // Path
-            var pathObj              = new GameObject($"Path_{roadId}_{dir}_{groupIndex}");
+            var pathObj              = new GameObject($"Path_{name}_{i}");
             pathObj.transform.parent = laneObj.transform;
             var path                 = pathObj.AddComponent<TrafficPath>();
             path.road                = this;
@@ -148,7 +146,7 @@ public class TrafficRoad : MonoBehaviour
                 float   t   = w / (float)waypointCount;
                 Vector3 pos = Vector3.Lerp(laneStart, laneEnd, t);
 
-                var wp               = new GameObject($"WP_{roadId}_{dir}_{groupIndex}_{w}");
+                var wp               = new GameObject($"WP_{name}_{i}_{w}");
                 wp.transform.position = pos;
                 wp.transform.parent  = pathObj.transform;
                 path.waypoints.Add(wp.transform);

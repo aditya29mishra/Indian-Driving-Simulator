@@ -201,26 +201,45 @@ public class IntersectionConnector : MonoBehaviour
         Vector3 p0 = start,  p1 = start + dirStart * turnRadius;
         Vector3 p3 = end,    p2 = end   - dirEnd   * turnRadius;
 
-        var obj              = new GameObject($"Turn_{fromLane.name}_TO_{toLane.name}");
-        obj.transform.parent = transform;
+        // Create arc Lane — child of IntersectionConnector
+        // Naming: Arc_{fromRoad}_{fromIndex}__{toRoad}_{toIndex}
+        string fromRoad = fromLane.road != null ? fromLane.road.name : "X";
+        string toRoad   = toLane.road   != null ? toLane.road.name   : "X";
+        string arcName  = $"Arc_{fromRoad}_{fromLane.laneIndex}__{toRoad}_{toLane.laneIndex}";
 
-        var path  = obj.AddComponent<TrafficPath>();
-        path.road = fromLane.road;
-        path.lane = toLane;
+        var laneObj              = new GameObject(arcName);
+        laneObj.transform.parent = transform;
 
+        var arcLane              = laneObj.AddComponent<TrafficLane>();
+        arcLane.road             = null;          // null road = arc lane (in intersection)
+        arcLane.forwardDirection = true;
+        arcLane.laneIndex        = fromLane.laneIndex;
+
+        // Create arc Path — child of arc Lane
+        var pathObj              = new GameObject($"ArcPath_{arcName}");
+        pathObj.transform.parent = laneObj.transform;
+
+        var path                 = pathObj.AddComponent<TrafficPath>();
+        path.road                = null;
+        path.lane                = arcLane;
+        arcLane.path             = path;
+
+        // Build Bezier waypoints
         for (int i = 0; i <= resolution; i++)
         {
             float   t  = i / (float)resolution;
             float   t1 = 1f - t;
             Vector3 pt = t1*t1*t1*p0 + 3f*t1*t1*t*p1 + 3f*t1*t*t*p2 + t*t*t*p3;
 
-            var wp               = new GameObject($"TurnWP_{i}");
+            var wp               = new GameObject($"WP_{i}");
             wp.transform.position = pt;
-            wp.transform.parent  = obj.transform;
+            wp.transform.parent  = pathObj.transform;
             path.waypoints.Add(wp.transform);
         }
 
-        fromLane.nextPaths.Add(new TrafficLane.LanePath { path = path, targetLane = toLane });
+        // Wire: fromLane → arcLane → toLane (all via nextLanes)
+        fromLane.nextLanes.Add(arcLane);
+        arcLane.nextLanes.Add(toLane);
     }
 
     Vector3 GetPathTipDirection(TrafficPath path, bool atEnd)
@@ -238,15 +257,17 @@ public class IntersectionConnector : MonoBehaviour
 
     void ClearOld()
     {
+        // Destroy existing arc lane GameObjects (children of this connector)
         for (int i = transform.childCount - 1; i >= 0; i--)
             DestroyImmediate(transform.GetChild(i).gameObject);
 
+        // Clear nextLanes on all road arm lanes so connections don't stack
         if (intersectionNode == null) return;
         foreach (var road in intersectionNode.connectedRoads)
         {
             if (road == null) continue;
             foreach (var lane in road.lanes)
-                if (lane != null) lane.nextPaths.Clear();
+                if (lane != null) lane.nextLanes.Clear();
         }
     }
 
@@ -272,4 +293,4 @@ public class IntersectionConnector : MonoBehaviour
         }
     }
 #endif
-}
+}   

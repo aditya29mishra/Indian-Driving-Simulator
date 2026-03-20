@@ -2,51 +2,44 @@ using System.Collections.Generic;
 using UnityEngine;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IntersectionPrioritySystem — pre-entry conflict resolution at intersections.
+// IntersectionPrioritySystem — decides WHO yields at intersection entry.
 //
-// Problem it solves:
-//   Two cars at the same intersection commit to turn paths that physically cross.
-//   Without this: both enter, both brake reactively mid-intersection, often collide.
-//   With this: before entry, one car yields at the stop line while the other goes.
+// Responsibility is narrow and clean:
+//   1. When car commits to a turn arc → register + classify turn type
+//   2. Geometric conflict detection against other registered arcs
+//   3. Priority comparison → set ShouldYieldAtEntry once
+//   4. Self-release via VehicleMap.Crossing (IDM watches the map, not this system)
+//   5. Yield timeout → prevents deadlock
 //
-// How it works:
-//   1. When a vehicle commits to a turn (ChooseTurnPath fires), this system
-//      registers the vehicle's chosen arc with the intersection.
-//   2. It scans for other registered vehicles at the same intersection whose
-//      arc is geometrically incompatible (crossing or merging into same space).
-//   3. A priority score is computed for each conflicting pair.
-//   4. The lower-priority vehicle is marked as ShouldYieldAtEntry = true.
-//   5. VehicleIDM reads ShouldYieldAtEntry and holds the vehicle at the stop line.
-//   6. When the higher-priority vehicle clears the conflict zone, the waiting
-//      vehicle's ShouldYieldAtEntry is cleared and it enters normally.
+// What this system does NOT do (handled by VehicleMap + IDM):
+//   - Track when conflicting car has cleared (map[Crossing] empties automatically)
+//   - Apply braking force (IDM reads map[Crossing] and brakes)
+//   - Notify other vehicles (each car self-releases via its own map)
 //
-// Priority score (higher = goes first):
-//   TurnType bonus: straight (3) > right turn (2) > left turn (1)
-//   Profile bonus:  Aggressive (+1.5), Normal (+1.0), Cautious (+0.5)
-//   Random jitter:  Random.Range(0, 1f) per vehicle per green phase
-//   — jitter breaks ties between identical profiles + turn types
-//   — makes behaviour feel human, not deterministic
+// Priority rules (left-hand traffic):
+//   Right turn  = 3  — shortest arc, never crosses anyone
+//   Straight    = 2  — crosses left-turn arcs only
+//   Left turn   = 1  — longest arc, crosses all others
+//   Same type   → profile tiebreak (Aggressive > Normal > Cautious)
+//                → first-registered wins if still tied
 //
-// OOP role: IVehicleBehaviour + static registry (IntersectionRegistry).
-//   The registry maps intersection positions → list of registered vehicles.
-//   Vehicles register on turn commit, deregister on exit.
+// Geometric conflict = any waypoint from arc A within 2.5m of any waypoint
+// from arc B. More accurate than midpoint distance.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── Static registry shared across all vehicles ────────────────────────────────
-// Maps a quantised intersection world position → vehicles currently registered.
-// Position is quantised to 4m grid so nearby lanes share the same bucket.
+// ── Static registry ───────────────────────────────────────────────────────────
 public static class IntersectionRegistry
 {
-    // Key: quantised intersection centre, Value: list of registered entries
     private static readonly Dictionary<Vector3Int, List<IntersectionEntry>> registry
         = new Dictionary<Vector3Int, List<IntersectionEntry>>();
 
     public struct IntersectionEntry
     {
         public TrafficVehicle vehicle;
-        public TrafficPath     chosenArc;     // the Bezier path they committed to
-        public float           priority;      // computed once at registration
-        public Vector3         arcMidpoint;   // midpoint of the arc, used for cross-check
+        public TrafficPath    chosenArc;
+        public int            turnType;      // 3=right, 2=straight, 1=left
+        public float          priority;      // turnType + profile tiebreak
+        public float          registeredTime;// Time.time at registration
     }
 
     static Vector3Int Quantise(Vector3 pos) =>
@@ -55,7 +48,6 @@ public static class IntersectionRegistry
             Mathf.RoundToInt(pos.y / 4f),
             Mathf.RoundToInt(pos.z / 4f));
 
-    /// <summary>Registers a vehicle's committed turn at this intersection position.</summary>
     public static void Register(Vector3 intersectionPos, IntersectionEntry entry)
     {
         var key = Quantise(intersectionPos);
@@ -64,12 +56,10 @@ public static class IntersectionRegistry
             list = new List<IntersectionEntry>(8);
             registry[key] = list;
         }
-        // Remove stale entry for this vehicle if it re-registers
         list.RemoveAll(e => e.vehicle == entry.vehicle);
         list.Add(entry);
     }
 
-    /// <summary>Returns all registered entries at this intersection position.</summary>
     public static List<IntersectionEntry> GetEntries(Vector3 intersectionPos)
     {
         var key = Quantise(intersectionPos);
@@ -77,7 +67,6 @@ public static class IntersectionRegistry
         return list;
     }
 
-    /// <summary>Removes a vehicle from the registry (called on exit or despawn).</summary>
     public static void Deregister(TrafficVehicle vehicle, Vector3 intersectionPos)
     {
         var key = Quantise(intersectionPos);
@@ -85,7 +74,6 @@ public static class IntersectionRegistry
             list.RemoveAll(e => e.vehicle == vehicle);
     }
 
-    /// <summary>Cleans up null vehicle references across all buckets.</summary>
     public static void PurgeNulls()
     {
         foreach (var list in registry.Values)
@@ -94,236 +82,368 @@ public static class IntersectionRegistry
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IntersectionPrioritySystem — per-vehicle behaviour module
+// IntersectionPrioritySystem — per-vehicle module
 // ─────────────────────────────────────────────────────────────────────────────
 
 public class IntersectionPrioritySystem : IVehicleBehaviour
 {
     private readonly VehicleContext ctx;
     private readonly TrafficVehicle owner;
-    private readonly PerceptionSystem perception;
 
-    // Radius to consider as "same intersection" for conflict detection
-    private const float IntersectionRadius = 18f;
-
-    // How far past the stop line before we consider "cleared the conflict zone"
-    private const float ClearDistance = 12f;
-
-    // True when this vehicle must wait at the stop line for a higher-priority car
     public bool ShouldYieldAtEntry { get; private set; }
 
-    // The intersection world position this vehicle registered at
-    private Vector3 registeredAt;
-    private bool    isRegistered = false;
+    // The specific vehicle we are yielding to — tracked for release condition
+    public TrafficVehicle YieldingToVehicle { get; private set; }
 
-    // Per-phase random jitter, set once when turn is committed
-    private float priorityJitter;
+    private Vector3 registeredAt;
+    private bool    isRegistered      = false;
+    private float   yieldTimer        = 0f;
+    private float   pendingDecideTimer = 0f;  // delay before first yield decision
+    private IntersectionRegistry.IntersectionEntry pendingEntry;
+    private const float YieldTimeout = 8f; // max wait before forcing entry
 
     public IntersectionPrioritySystem(VehicleContext ctx, TrafficVehicle owner,
                                       PerceptionSystem perception)
     {
-        this.ctx         = ctx;
-        this.owner       = owner;
-        this.perception  = perception;
+        this.ctx   = ctx;
+        this.owner = owner;
     }
 
-    public void OnSpawn()  { Deregister(); ShouldYieldAtEntry = false; }
+    public void OnSpawn()  { Deregister(); ShouldYieldAtEntry = false; yieldTimer = 0f; }
     public void OnDespawn(){ Deregister(); }
 
     public void Tick(float dt)
     {
-        // Only active when approaching an intersection (has signal, not inside yet)
-        bool approachingIntersection = ctx.CurrentSignal != null &&
-                                       ctx.CurrentLane   != null &&
-                                       !ctx.InsideIntersection;
-
-        // Clear registration and yield flag once we've entered and cleared
+        // Deregister once we've entered and are through the intersection
         if (isRegistered && ctx.InsideIntersection)
         {
-            // Check if we've moved far enough through the intersection to be clear
             float distFromEntry = Vector3.Distance(ctx.Transform.position, registeredAt);
-            if (distFromEntry > ClearDistance)
+            if (distFromEntry > 14f)
             {
-                // We've cleared — notify waiting vehicles
-                NotifyWaitersWeCleated();
                 Deregister();
                 ShouldYieldAtEntry = false;
+                yieldTimer = 0f;
             }
-        }
-
-        if (!approachingIntersection)
-        {
-            if (!ctx.InsideIntersection && isRegistered)
-                Deregister();
             return;
         }
 
-        // Refresh conflict check while waiting at stop line
-        if (isRegistered && ShouldYieldAtEntry)
-            RefreshYieldDecision();
+        // Delayed first yield decision — ensures all simultaneous registrations visible
+        if (pendingDecideTimer > 0f)
+        {
+            pendingDecideTimer -= dt;
+            if (pendingDecideTimer <= 0f)
+            {
+                pendingDecideTimer = 0f;
+                DecideYield(pendingEntry);
+            }
+        }
+
+        if (!isRegistered) return;
+        if (!ShouldYieldAtEntry) return;
+
+        yieldTimer += dt;
+
+        // Release conditions — only release when the causing car has actually passed:
+        //
+        // Condition A: causing car is now in Crossing zone (entered intersection,
+        //   confirmed present, we can see it crossing) — keep waiting
+        //
+        // Condition B: causing car was in Crossing, now gone from ALL zones —
+        //   it has fully passed through → release
+        //
+        // Condition C: causing car is in FrontClose/Mid/Far ahead of us in the
+        //   same direction → it has passed and is ahead on exit road → release
+        //
+        // Condition D: timeout — deadlock prevention
+
+        bool causingCarCleared = false;
+
+        if (YieldingToVehicle == null)
+        {
+            // No specific car tracked — use map[Crossing] as before
+            var crossCell2 = ctx.Map?[MapZone.Crossing];
+            causingCarCleared = (crossCell2 == null || crossCell2.vehicle == null);
+        }
+        else
+        {
+            // Track the specific car we are yielding to
+            var map = ctx.Map;
+            bool isInCrossing  = map != null && map[MapZone.Crossing].vehicle == YieldingToVehicle;
+            bool isAheadOfUs   = IsVehicleAheadAndCleared(YieldingToVehicle);
+
+            if (isInCrossing)
+            {
+                // Still crossing — keep waiting, reset partial timer
+                causingCarCleared = false;
+            }
+            else if (isAheadOfUs)
+            {
+                // Has passed us and is now ahead — safe to enter
+                causingCarCleared = true;
+            }
+            else
+            {
+                // Not in crossing, not ahead — either hasn't arrived yet or gone
+                // Only release if it's been long enough (partial timeout)
+                causingCarCleared = yieldTimer > YieldTimeout * 0.5f;
+            }
+        }
+
+        if (causingCarCleared)
+        {
+            ctx.Log("INTERSECTION_ENTER", YieldingToVehicle?.GetVehicleId() ?? "",
+                    registeredAt.ToString("F0"), "causing_car_cleared");
+            ShouldYieldAtEntry    = false;
+            YieldingToVehicle     = null;
+            yieldTimer            = 0f;
+            ctx.YieldReleaseTimer = VehicleContext.YieldReleaseDuration;
+            return;
+        }
+
+        // Deadlock detection: both cars stopped and both yielding to each other
+        // If ego is stopped AND causing car is also stopped AND waited > 2s
+        // → break deadlock by vehicle ID (one car must go first)
+        if (yieldTimer > 2f && ctx.CurrentSpeed < 0.2f && YieldingToVehicle != null)
+        {
+            bool otherAlsoStopped = YieldingToVehicle.CurrentSpeed < 0.2f;
+            bool otherAlsoYielding = YieldingToVehicle.IntersectionPriority?.ShouldYieldAtEntry ?? false;
+
+            if (otherAlsoStopped && otherAlsoYielding)
+            {
+                // Both deadlocked — lower vehicle ID goes first (deterministic)
+                bool iGoFirst = string.Compare(owner.GetVehicleId(),
+                                               YieldingToVehicle.GetVehicleId(),
+                                               System.StringComparison.Ordinal) < 0;
+                if (iGoFirst)
+                {
+                    ctx.Log("INTERSECTION_ENTER", YieldingToVehicle.GetVehicleId(),
+                            registeredAt.ToString("F0"), "deadlock_broken");
+                    ShouldYieldAtEntry  = false;
+                    YieldingToVehicle   = null;
+                    yieldTimer          = 0f;
+                    ctx.YieldReleaseTimer = VehicleContext.YieldReleaseDuration;
+                    return;
+                }
+            }
+        }
+
+        // Hard timeout — prevents permanent deadlock
+        if (yieldTimer >= YieldTimeout)
+        {
+            ctx.Log("INTERSECTION_ENTER", "", registeredAt.ToString("F0"),
+                    "yield_timeout");
+            ShouldYieldAtEntry  = false;
+            YieldingToVehicle   = null;
+            yieldTimer          = 0f;
+            ctx.YieldReleaseTimer = VehicleContext.YieldReleaseDuration;
+        }
     }
 
-    /// <summary>
-    /// Called by VehicleNavigator.ChooseTurnPath when a turn arc is committed.
-    /// Registers this vehicle with the intersection, computes priority,
-    /// and determines if it must yield.
-    /// </summary>
+    // ─────────────────────────────────────────────────────────────────────────
+    // Turn commitment — called by VehicleNavigator when arc is chosen
+    // ─────────────────────────────────────────────────────────────────────────
+
     public void OnTurnCommitted(TrafficPath chosenArc, Vector3 intersectionCentre)
     {
-        registeredAt   = intersectionCentre;
-        priorityJitter = Random.Range(0f, 1f);
+        registeredAt = intersectionCentre;
+        yieldTimer   = 0f;
 
-        float priority = ComputePriority(chosenArc);
+        int   turnType = ClassifyTurn(chosenArc);
+        float priority = ComputePriority(turnType);
+
+        // Store on context so IDM + WorldPerception can read it
+        // without needing registry lookup
+        ctx.CurrentTurnType = turnType;
 
         var entry = new IntersectionRegistry.IntersectionEntry
         {
-            vehicle     = owner,
-            chosenArc   = chosenArc,
-            priority    = priority,
-            arcMidpoint = chosenArc != null && chosenArc.waypoints.Count > 0
-                ? chosenArc.GetPointAtDistance(chosenArc.TotalLength * 0.5f)
-                : intersectionCentre
+            vehicle        = owner,
+            chosenArc      = chosenArc,
+            turnType       = turnType,
+            priority       = priority,
+            registeredTime = Time.time
         };
+        pendingEntry       = entry;
         IntersectionRegistry.Register(intersectionCentre, entry);
-        isRegistered = true;
+        isRegistered       = true;
+        pendingDecideTimer = 0.05f; // small delay so simultaneous registrations
+                                    // are all visible before we decide yield
 
-        // Log the turn commitment and priority score
         ctx.Log("INTERSECTION_REGISTERED",
             chosenArc?.name ?? "none",
             intersectionCentre.ToString("F0"),
-            $"priority={priority:F2} turn={ClassifyTurnName(chosenArc)}",
+            $"turn={TurnName(turnType)} priority={priority:F2}",
             priority);
-
-        RefreshYieldDecision();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Priority calculation
+    // Priority + yield decision
     // ─────────────────────────────────────────────────────────────────────────
 
-    float ComputePriority(TrafficPath arc)
+    void DecideYield(IntersectionRegistry.IntersectionEntry myEntry)
     {
-        // Turn type score: classify arc by how much heading changes
-        float turnScore = ClassifyTurn(arc);
+        ShouldYieldAtEntry = false;
 
-        // Profile score
-        float profileScore = ctx.DriverProfile == TrafficVehicle.DriverProfile.Aggressive ? 1.5f
-                           : ctx.DriverProfile == TrafficVehicle.DriverProfile.Cautious    ? 0.5f
-                           : 1.0f;
-
-        // jitter: breaks symmetry between identical situations
-        return turnScore + profileScore + priorityJitter;
-    }
-
-    float ClassifyTurn(TrafficPath arc)
-    {
-        if (arc == null || arc.waypoints.Count < 2) return 2f; // assume straight
-
-        // Measure how much the arc turns by comparing entry and exit headings
-        Vector3 entryDir = (arc.waypoints[1].position - arc.waypoints[0].position).normalized;
-        Vector3 exitDir  = (arc.waypoints[arc.waypoints.Count - 1].position -
-                            arc.waypoints[arc.waypoints.Count - 2].position).normalized;
-
-        float turnDeg = Vector3.Angle(entryDir, exitDir);
-
-        if (turnDeg < 25f)  return 3f; // straight — highest priority
-        // Determine left vs right by cross product
-        float cross = Vector3.Dot(Vector3.Cross(entryDir, exitDir), Vector3.up);
-        if (cross >= 0f)    return 2f; // right turn — medium priority
-        return 1f;                      // left turn  — lowest priority
-    }
-
-    // Returns readable turn name for CSV logging
-    string ClassifyTurnName(TrafficPath arc)
-    {
-        float s = ClassifyTurn(arc);
-        return s >= 3f ? "straight" : s >= 2f ? "right" : "left";
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Conflict detection
-    // ─────────────────────────────────────────────────────────────────────────
-
-    public void RefreshYieldDecision()
-    {
-        if (!isRegistered) return;
         var entries = IntersectionRegistry.GetEntries(registeredAt);
-        if (entries == null || entries.Count <= 1) { ShouldYieldAtEntry = false; return; }
+        if (entries == null || entries.Count <= 1) return;
 
-        IntersectionRegistry.IntersectionEntry? myEntry = null;
-        foreach (var e in entries)
-            if (e.vehicle == owner) { myEntry = e; break; }
-        if (myEntry == null) { ShouldYieldAtEntry = false; return; }
-
-        float myPriority  = myEntry.Value.priority;
-        bool  wasYielding = ShouldYieldAtEntry;
-        string yieldingTo = "";
-
-        perception.Map.crossingPaths?.Clear();
-        perception.Map.EnsureList();
         bool mustYield = false;
+        string yieldingTo = "";
 
         foreach (var other in entries)
         {
             if (other.vehicle == owner || other.vehicle == null) continue;
-            if (!ArcsConflict(myEntry.Value.arcMidpoint, other.arcMidpoint)) continue;
 
-            perception.Map.crossingPaths.Add(other.vehicle);
+            // Only yield to cars whose arcs geometrically conflict with ours
+            if (!ArcsConflict(myEntry.chosenArc, other.chosenArc)) continue;
 
-            // Log every detected crossing conflict (fires once per conflict pair)
             ctx.Log("CROSSING_CONFLICT",
                 other.vehicle.GetVehicleId(),
                 registeredAt.ToString("F0"),
-                $"me={myPriority:F2} other={other.priority:F2}",
-                myPriority);
+                $"me={TurnName(myEntry.turnType)}({myEntry.priority:F1}) " +
+                $"other={TurnName(other.turnType)}({other.priority:F1})");
 
-            if (other.priority > myPriority)
+            if (other.priority > myEntry.priority)
             {
                 mustYield  = true;
                 yieldingTo = other.vehicle.GetVehicleId();
+                break; // yield to first higher-priority conflict found
+            }
+
+            // Same priority — first registered goes first
+            // Use 0.3f window (larger than float noise) to catch near-equal priorities
+            if (Mathf.Abs(other.priority - myEntry.priority) < 0.3f)
+            {
+                // First registered wins
+                bool otherFirst = other.registeredTime < myEntry.registeredTime - 0.01f;
+                // Tiebreak by vehicle ID string comparison (deterministic, no randomness)
+                bool otherWinsTie = !otherFirst &&
+                    Mathf.Abs(other.registeredTime - myEntry.registeredTime) <= 0.01f &&
+                    string.Compare(other.vehicle.GetVehicleId(),
+                                   owner.GetVehicleId(),
+                                   System.StringComparison.Ordinal) < 0;
+
+                if (otherFirst || otherWinsTie)
+                {
+                    mustYield  = true;
+                    yieldingTo = other.vehicle.GetVehicleId();
+                    break;
+                }
             }
         }
 
-        // Log transitions only — not every tick
-        if (mustYield && !wasYielding)
-            ctx.Log("INTERSECTION_YIELD",
-                yieldingTo,
-                registeredAt.ToString("F0"),
-                $"myPriority={myPriority:F2}",
-                myPriority);
-        else if (!mustYield && wasYielding)
-            ctx.Log("INTERSECTION_ENTER",
-                "",
-                registeredAt.ToString("F0"),
-                "cleared_to_enter",
-                myPriority);
+        if (mustYield)
+        {
+            ctx.Log("INTERSECTION_YIELD", yieldingTo,
+                    registeredAt.ToString("F0"),
+                    $"priority={myEntry.priority:F2}");
+            ShouldYieldAtEntry = true;
 
-        ShouldYieldAtEntry = mustYield;
+            // Store which vehicle caused the yield so Tick can track it
+            var entries2 = IntersectionRegistry.GetEntries(registeredAt);
+            if (entries2 != null)
+                foreach (var e in entries2)
+                    if (e.vehicle != null && e.vehicle.GetVehicleId() == yieldingTo)
+                    { YieldingToVehicle = e.vehicle; break; }
+        }
+        else
+        {
+            YieldingToVehicle = null;
+        }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Turn classification
+    // ─────────────────────────────────────────────────────────────────────────
+
+    int ClassifyTurn(TrafficPath arc)
+    {
+        if (arc == null || arc.waypoints.Count < 2) return 2; // assume straight
+
+        Vector3 entryDir = (arc.waypoints[1].position -
+                            arc.waypoints[0].position).normalized;
+        Vector3 exitDir  = (arc.waypoints[arc.waypoints.Count - 1].position -
+                            arc.waypoints[arc.waypoints.Count - 2].position).normalized;
+
+        float turnDeg = Vector3.Angle(entryDir, exitDir);
+        if (turnDeg < 25f) return 2; // straight
+
+        // Cross product Y component: positive = right turn (left-hand traffic)
+        float cross = Vector3.Dot(Vector3.Cross(entryDir, exitDir), Vector3.up);
+        return cross >= 0f ? 3 : 1; // 3 = right, 1 = left
+    }
+
+    float ComputePriority(int turnType)
+    {
+        // Turn type is the dominant factor — no random jitter
+        float typeScore = turnType; // 3, 2, or 1
+
+        // Profile is a small tiebreaker within the same turn type
+        float profileScore = ctx.DriverProfile == TrafficVehicle.DriverProfile.Aggressive ? 0.4f
+                           : ctx.DriverProfile == TrafficVehicle.DriverProfile.Cautious    ? 0.1f
+                           : 0.2f;
+
+        return typeScore + profileScore;
+    }
+
+    string TurnName(int t) => t == 3 ? "right" : t == 2 ? "straight" : "left";
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Geometric conflict — waypoint proximity
+    // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Two arcs conflict if their midpoints are close — both pass through
-    /// the same zone of the intersection. 6m threshold covers a car length
-    /// plus margin.
+    /// Two arcs conflict if any waypoint from arc A is within 2.5m of any
+    /// waypoint from arc B. More accurate than midpoint distance.
+    /// At resolution=12, this is 12×12=144 checks — cheap.
     /// </summary>
-    bool ArcsConflict(Vector3 myMid, Vector3 otherMid)
+    bool ArcsConflict(TrafficPath arcA, TrafficPath arcB)
     {
-        // If arc midpoints are within 8m of each other, the arcs share space
-        return Vector3.Distance(myMid, otherMid) < 8f;
+        if (arcA == null || arcB == null) return false;
+        if (arcA.waypoints == null || arcB.waypoints == null) return false;
+
+        const float ConflictDist = 2.5f; // half lane width
+
+        foreach (var wpA in arcA.waypoints)
+        {
+            if (wpA == null) continue;
+            foreach (var wpB in arcB.waypoints)
+            {
+                if (wpB == null) continue;
+                if (Vector3.Distance(wpA.position, wpB.position) < ConflictDist)
+                    return true;
+            }
+        }
+        return false;
     }
 
-    void NotifyWaitersWeCleated()
-    {
-        ctx.Log("INTERSECTION_CLEARED", "", registeredAt.ToString("F0"), "arc_complete");
+    // ─────────────────────────────────────────────────────────────────────────
+    // Release helpers
+    // ─────────────────────────────────────────────────────────────────────────
 
-        var entries = IntersectionRegistry.GetEntries(registeredAt);
-        if (entries == null) return;
-        foreach (var e in entries)
-        {
-            if (e.vehicle == null || e.vehicle == owner) continue;
-            // Use public property — intersectionPriority field is private
-            e.vehicle.IntersectionPriority?.RefreshYieldDecision();
-        }
+    /// <summary>
+    /// Returns true if the causing vehicle has passed through the intersection
+    /// and is now physically ahead of us — lon > 0 in our local space.
+    /// This is the cleanest release condition: the car we were waiting for
+    /// has crossed and is now on the other side.
+    /// </summary>
+    bool IsVehicleAheadAndCleared(TrafficVehicle other)
+    {
+        if (other == null) return true;
+        Vector3 toOther = other.transform.position - ctx.Transform.position;
+        float   lon     = Vector3.Dot(toOther, ctx.Transform.forward);
+        float   dist    = toOther.magnitude;
+        // Ahead of us (lon > 5m) and not still in intersection zone (dist > 8m)
+        return lon > 5f && dist > 8f;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Cleanup
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public void RefreshYieldDecision()
+    {
+        // Legacy hook — kept for compatibility. Self-release now handled in Tick.
     }
 
     void Deregister()
@@ -331,7 +451,9 @@ public class IntersectionPrioritySystem : IVehicleBehaviour
         if (isRegistered)
         {
             IntersectionRegistry.Deregister(owner, registeredAt);
-            isRegistered = false;
+            isRegistered         = false;
+            YieldingToVehicle    = null;
+            ctx.CurrentTurnType  = 0; // clear when leaving intersection
         }
     }
 }

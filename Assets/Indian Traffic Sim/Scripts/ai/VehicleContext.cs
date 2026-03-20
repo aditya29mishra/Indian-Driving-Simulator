@@ -24,7 +24,8 @@ public class VehicleContext
     public Transform Transform  { get; private set; }
 
     // ── IDM config (set by Initialize, read by IDM and Negotiator) ─────────
-    public float DesiredSpeedMs  { get; set; }
+    public float DesiredSpeedMs  { get; set; }  // dynamic — adjusted by IDM each tick
+    public float BaseSpeedMs     { get; set; }  // fixed at spawn — personality speed, never changes
     public float MaxSpeedKph     { get; set; }
     public float Acceleration    { get; set; }
     public float Braking         { get; set; }
@@ -53,7 +54,21 @@ public class VehicleContext
     public TrafficSignal.SignalState PrevSignalState         { get; set; }
     public TrafficSignal.SignalState CurrentSignalStateCached{ get; set; }
 
+    // ── Intersection yield release ramp ──────────────────────────────────
+    // After yield releases, ramp speed up slowly instead of snapping
+    public float YieldReleaseTimer    { get; set; }
+    public float _yieldRampMaxAccel   { get; set; } = float.MaxValue;
+    public const float YieldReleaseDuration = 1.5f;
+
+    // ── Intersection turn type (written by IntersectionPrioritySystem) ─────
+    // 0=none, 1=left, 2=straight, 3=right
+    // Set when arc is committed, cleared when exiting intersection.
+    // Read by IDM for two-bool crossing yield decision.
+    public int CurrentTurnType { get; set; }
+
     // ── Lane change state (written by Negotiator) ─────────────────────────
+    public bool         OvertakeBoostActive  { get; set; }  // true while actively overtaking
+    public float        OvertakeCooldown     { get; set; }  // prevents immediate re-overtake
     public float        LaneChangeCooldown   { get; set; }
     public float        LaneChangeCheckTimer { get; set; }
     public TrafficVehicle.ManeuverState PendingManeuverState { get; set; }
@@ -72,6 +87,11 @@ public class VehicleContext
     public TrafficLane    LeftLane      { get; set; }
     public TrafficLane    RightLane     { get; set; }
     public TrafficVehicle LeaderVehicle { get; set; }
+
+    // ── Perception map ───────────────────────────────────────────────────
+    // Local spatial minimap — populated by WorldPerception every tick.
+    // All AI systems read from here for neighbour detection.
+    public VehicleMap Map { get; } = new VehicleMap();
 
     // ── Destination system ────────────────────────────────────────────────
     // DestNode: the TrafficRoadNode (NodeType.End) this vehicle is heading toward.
@@ -132,6 +152,7 @@ public class VehicleContext
         DriverProfile    = cfg.profile;
         MaxSpeedKph      = cfg.maxSpeedKph;
         DesiredSpeedMs   = cfg.desiredSpeedMs;
+        BaseSpeedMs      = cfg.desiredSpeedMs;  // locked at spawn
         Acceleration     = cfg.acceleration;
         Braking          = cfg.braking;
         TimeHeadway      = cfg.timeHeadway;

@@ -166,7 +166,7 @@ public class VehicleSpawner : MonoBehaviour
             // determines direction. If waypoints[0] is closer → lane starts at End node → spawn lane.
             foreach (var lane in road.lanes)
             {
-                if (lane == null || !lane.forwardDirection) continue;
+                if (lane == null) continue;
                 if (lane.path == null || lane.path.waypoints == null ||
                     lane.path.waypoints.Count < 2) continue;
 
@@ -452,7 +452,7 @@ public class VehicleSpawner : MonoBehaviour
             bool foundSpawnLane = false;
             foreach (var lane in road.lanes)
             {
-                if (lane == null || !lane.forwardDirection) continue;
+                if (lane == null) continue;
                 if (lane.path == null || lane.path.waypoints == null ||
                     lane.path.waypoints.Count < 2) continue;
 

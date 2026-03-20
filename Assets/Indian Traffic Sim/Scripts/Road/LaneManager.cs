@@ -9,6 +9,11 @@ public class LaneManager : MonoBehaviour
     [Header("Scene Setup")]
     [Tooltip("All TrafficRoad components in the scene.")]
     public List<TrafficRoad>           roads                  = new List<TrafficRoad>();
+
+    // WorldPerception is auto-added in Awake if not already present.
+    // It runs UpdateAllMaps every FixedUpdate tick.
+    [HideInInspector]
+    public WorldPerception worldPerception;
     [Tooltip("All IntersectionConnector components in the scene.")]
     public List<IntersectionConnector> intersectionConnectors = new List<IntersectionConnector>();
     [Tooltip("All TrafficSignal components in the scene.")]
@@ -41,16 +46,10 @@ public class LaneManager : MonoBehaviour
         }
         Debug.Log($"[LaneManager] Step 1 complete — {roadCount} road(s) generated.");
 
-        // Step 1b — Joint / Cross / T lane wiring
-        // Walks every TrafficRoadNode with nodeType Joint, Cross, or T.
-        // For each, finds the two roads that meet at that node, classifies
-        // lanes as arriving or departing using waypoint distances (no
-        // forwardDirection assumption), then wires nextLanes with direct
-        // index pairing (same direction of travel, no flip = no reversal needed).
-        int jointCount = WireJointNodes();
-        Debug.Log($"[LaneManager] Step 1b complete — {jointCount} joint/cross/T node(s) wired.");
-
-        // Step 2 — Intersection arcs (connector clears old arcs + nextPaths before rebuilding)
+        // Step 2 — Intersection arcs
+        // IntersectionConnector.ClearOld clears nextLanes on road arm lanes,
+        // then creates arc lanes and wires: road lane → arc lane → exit road lane.
+        // Must run BEFORE joint wiring so ClearOld doesn't erase joint connections.
         int intersectionCount = 0;
         foreach (var ic in intersectionConnectors)
         {
@@ -59,6 +58,12 @@ public class LaneManager : MonoBehaviour
             intersectionCount++;
         }
         Debug.Log($"[LaneManager] Step 2 complete — {intersectionCount} intersection(s) generated.");
+
+        // Step 2b — Joint / Cross / T lane wiring
+        // Runs AFTER intersection arcs so ClearOld doesn't wipe joint nextLanes.
+        // Wires arriving → departing lanes via nextLanes for straight-through nodes.
+        int jointCount = WireJointNodes();
+        Debug.Log($"[LaneManager] Step 2b complete — {jointCount} joint/cross/T node(s) wired.");
 
         // Step 3 — Signal lane groups (signal clears groups before rebuilding)
         int signalCount = 0;
@@ -84,11 +89,20 @@ public class LaneManager : MonoBehaviour
     private Dictionary<TrafficLane, TrafficLane>          leftNeighbour     = new();
     private Dictionary<TrafficLane, TrafficLane>          rightNeighbour    = new();
     private Dictionary<TrafficVehicle, TrafficLane>       lastKnownLane     = new();
-    private List<TrafficVehicle>                          registeredVehicles = new();
+    public List<TrafficVehicle>                          registeredVehicles = new();
     private Dictionary<TrafficLane, List<TrafficVehicle>> laneVehicles      = new();
 
     private float       updateTimer    = 0f;
     private const float updateInterval = 0.2f;
+
+    void Awake()
+    {
+        // Ensure WorldPerception is present — add it if missing
+        worldPerception = GetComponent<WorldPerception>();
+        if (worldPerception == null)
+            worldPerception = gameObject.AddComponent<WorldPerception>();
+        worldPerception.laneManager = this;
+    }
 
     void Start()
     {
@@ -164,6 +178,11 @@ public class LaneManager : MonoBehaviour
 
     void UpdateLaneOrdering()
     {
+        // IDM now reads its leader from VehicleMap.FrontClose (updated every tick
+        // by WorldPerception). LaneManager only sets leaderVehicle for one purpose:
+        // queue ripple — when a signal turns green, the front car should have no
+        // leader so it moves first, creating a natural ripple wave behind it.
+        // All other leader assignment is handled by WorldPerception + VehicleMap.
         foreach (var kvp in laneVehicles)
         {
             var list = kvp.Value;
@@ -175,6 +194,9 @@ public class LaneManager : MonoBehaviour
                 var v      = list[i];
                 var leader = (i < list.Count - 1) ? list[i + 1] : null;
 
+                // Queue ripple: during signal release phase, only suppress leader
+                // for the front-of-queue vehicle so it moves first.
+                // For all other signal states: clear leaderVehicle — IDM uses map instead.
                 if (v.CurrentSignalState == TrafficVehicle.SignalStateEx.Released)
                 {
                     bool isFront = v.negotiator?.QueueRipple?.IsFrontOfQueue ?? true;
@@ -182,7 +204,8 @@ public class LaneManager : MonoBehaviour
                 }
                 else
                 {
-                    v.leaderVehicle = leader;
+                    // Clear — IDM reads from VehicleMap.FrontClose
+                    v.leaderVehicle = null;
                 }
             }
         }
