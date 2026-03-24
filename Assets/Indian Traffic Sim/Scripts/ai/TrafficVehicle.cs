@@ -39,6 +39,9 @@ public partial class TrafficVehicle : MonoBehaviour
         // destNode: the RoadEnd node this vehicle is navigating toward.
         // Set by VehicleSpawner.PickDestinationNode at spawn. Null = random wandering (legacy).
         public TrafficRoadNode destNode;
+        // vehicleProfile: full type profile — Physical, Agility, Social specs.
+        // Null = legacy spawn (float fields used directly).
+        public VehicleProfile vehicleProfile;
     }
 
     // ── Public state (read by LaneManager, VehicleRecorder, debug tools) ──
@@ -149,6 +152,11 @@ public partial class TrafficVehicle : MonoBehaviour
     {
         ctx.ApplyConfig(cfg);
         GetComponent<CarMove>()?.SetTopSpeed(cfg.maxSpeedKph);
+        // Apply profile-specific physics settings to CarMove
+        if (cfg.vehicleProfile != null)
+        {
+            GetComponent<CarMove>()?.SetMaxSteerAngle(cfg.vehicleProfile.Agility.maxSteerAngle);
+        }
     }
 
     void Start()

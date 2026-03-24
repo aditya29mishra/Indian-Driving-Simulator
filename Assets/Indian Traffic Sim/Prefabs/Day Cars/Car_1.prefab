@@ -222,7 +222,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &4041183092111876
 Transform:
   m_ObjectHideFlags: 0
@@ -717,7 +717,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &4314250259691256
 Transform:
   m_ObjectHideFlags: 0
@@ -905,7 +905,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &4981289593113848
 Transform:
   m_ObjectHideFlags: 0
@@ -974,6 +974,7 @@ GameObject:
   - component: {fileID: 114526394747327244}
   - component: {fileID: -7985226399314112957}
   - component: {fileID: 4187792036027221883}
+  - component: {fileID: 1150683688093604722}
   m_Layer: 9
   m_Name: Car_1
   m_TagString: Car
@@ -1102,13 +1103,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: bd2db5311852162478e265f6b7988a3b, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  currentSignal: {fileID: 0}
-  laneManager: {fileID: 0}
-  currentLane: {fileID: 0}
-  leftLane: {fileID: 0}
-  rightLane: {fileID: 0}
-  leaderVehicle: {fileID: 0}
-  driverProfile: 1
 --- !u!114 &4187792036027221883
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1134,6 +1128,18 @@ MonoBehaviour:
   m_RevRangeBoundary: 1
   m_SlipLimit: 0.4
   m_BrakeTorque: 20000
+--- !u!114 &1150683688093604722
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1760368921295162}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f031ef74a26c1384497662c5fd05722d, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
 --- !u!1 &1765236597787372
 GameObject:
   m_ObjectHideFlags: 0
@@ -1494,7 +1500,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &4059397288360304
 Transform:
   m_ObjectHideFlags: 0

@@ -7,21 +7,24 @@ using UnityEngine;
 //
 // Lives on LaneManager (one instance per scene).
 //
-// Algorithm:
+// VehicleProfile integration:
+//   Zone boundaries now scale from VEHICLE WIDTH, not just lane width.
+//   A bike (0.85m wide) has a narrow HalfLane — it sees itself fitting in
+//   gaps a car cannot. This is what enables gap threading and lane splitting
+//   to emerge naturally from perception, not from special-case logic.
+//
+//   canGapThread vehicles (bikes, rickshaws) get an additional classification
+//   override: vehicles slightly ahead but laterally offset are reclassified
+//   as Beside rather than FrontClose, so the bike sees them as gaps to thread
+//   rather than blockers.
+//
+// Algorithm (unchanged):
 //   For each ego vehicle A:
 //     1. Clear A's map
-//     2. Update A's map zone boundaries based on A's current speed
-//     3. For each other vehicle B in registeredVehicles:
-//        a. Compute world distance — cull if beyond FrontFar (cheap early exit)
-//        b. Transform B's position into A's local space (2 dot products)
-//        c. Classify into zone and insert if closer than current cell occupant
+//     2. Update A's map zone boundaries (now width-aware)
+//     3. For each other vehicle B: dot-product classify into zone
 //
-// Cost: O(N²) dot products. At N=40: 1560 pairs × 4 float ops = 6240 ops/tick.
-// Zero Physics API calls. Works on road lanes, arc lanes, intersections.
-//
-// Two-way awareness emerges naturally: A's scan sees B from A's perspective,
-// B's scan sees A from B's perspective. No shared state between cars.
-// Each car has a correct independent view of the world.
+// Cost: O(N²) dot products. Zero Physics API calls.
 //
 // Talks to: LaneManager (vehicle list), VehicleMap (per-car data), TrafficVehicle
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,22 +80,23 @@ public class WorldPerception : MonoBehaviour
             VehicleMap map = ego.Map;
             if (map == null) continue;
 
-            float egoSpeed  = ego.CurrentSpeed;
-            float laneWidth = GetLaneWidth(ego);
-            bool  inInter   = ego.IsInsideIntersection;
+            float egoSpeed    = ego.CurrentSpeed;
+            float laneWidth   = GetLaneWidth(ego);
+            float vehicleWidth = GetVehicleWidth(ego);
+            bool  inInter     = ego.IsInsideIntersection;
 
-            // Approaching = has a signal assigned and not yet inside
-            // Used to expand CrossRadius so perpendicular cars detected early
-            bool isApproaching = !inInter &&
-                                  ego.context?.CurrentSignal != null;
+            bool isApproaching = !inInter && ego.context?.CurrentSignal != null;
 
-            // Step 1 — clear previous frame data
+            // Precompute ego gap-threading flag outside the inner loop
+            bool egoCanGapThread = ego.context?.CanGapThread ?? false;
+
+            // Step 1 — clear
             map.Clear();
 
-            // Step 2 — update dynamic zone boundaries for this ego + speed
-            map.UpdateBoundaries(egoSpeed, laneWidth, isApproaching);
+            // Step 2 — update zone boundaries with vehicle width
+            map.UpdateBoundaries(egoSpeed, laneWidth, vehicleWidth, isApproaching);
 
-            // Step 3 — scan all other vehicles
+            // Step 3 — scan
             Vector3 egoPos     = ego.transform.position;
             Vector3 egoForward = ego.transform.forward;
             Vector3 egoRight   = ego.transform.right;
@@ -107,30 +111,23 @@ public class WorldPerception : MonoBehaviour
                 Vector3 toOther = other.transform.position - egoPos;
                 float   dist    = toOther.magnitude;
 
-                // Early cull — beyond max detection range
                 if (dist > map.FrontFar + 5f) continue;
                 if (dist < 0.3f) continue;
 
-                // Transform into ego-local space
                 float lon = Vector3.Dot(toOther, egoForward);
                 float lat = Vector3.Dot(toOther, egoRight);
 
-                // Relative speed: positive = closing
                 float relSpeed = lon >= 0f
                     ? egoSpeed - other.CurrentSpeed
                     : other.CurrentSpeed - egoSpeed;
 
-                // Classify into zone
                 MapZone zone = map.Classify(lon, lat, dist, inInter,
-                                            other.transform.forward, egoForward);
+                                            other.transform.forward, egoForward,
+                                            egoCanGapThread);
 
                 if (zone == MapZone.Count) continue;
 
-                // ── Priority masking — skip secondary zones if primary is filled ──
-                // Forward axis: FrontClose > FrontMid > FrontFar
-                // Rear axis:    RearClose  > RearFar
-                // Primary zones (Beside, FrontLeft/Right, RearLeft/Right, Crossing)
-                // are always populated — no masking applied.
+                // Priority masking — skip secondary zones if primary is filled
                 if (zone == MapZone.FrontMid &&
                     map.HasVehicle(MapZone.FrontClose)) continue;
 
@@ -141,7 +138,6 @@ public class WorldPerception : MonoBehaviour
                 if (zone == MapZone.RearFar &&
                     map.HasVehicle(MapZone.RearClose)) continue;
 
-                // Insert — keep closest vehicle per zone
                 MapCell cell = map[zone];
                 if (cell.vehicle == null || dist < cell.distance)
                     cell.Set(other, dist, relSpeed, lon, lat);
@@ -155,14 +151,22 @@ public class WorldPerception : MonoBehaviour
 
     float GetLaneWidth(TrafficVehicle vehicle)
     {
-        // Try to read from current lane's road
         TrafficLane lane = vehicle.currentLane;
         if (lane?.road != null) return lane.road.laneWidth;
         return defaultLaneWidth;
     }
 
+    /// <summary>
+    /// Returns this vehicle's physical width from its VehicleProfile.
+    /// Falls back to a car default (1.9m) for legacy vehicles without a profile.
+    /// </summary>
+    float GetVehicleWidth(TrafficVehicle vehicle)
+    {
+        return vehicle.context?.VehicleWidth ?? 1.9f;
+    }
+
     // ─────────────────────────────────────────────────────────────────────
-    // Gizmos — visualise one vehicle's map in Scene view
+    // Gizmos
     // ─────────────────────────────────────────────────────────────────────
 
 #if UNITY_EDITOR
@@ -177,10 +181,7 @@ public class WorldPerception : MonoBehaviour
         Vector3 egoForward = debugVehicle.transform.forward;
         Vector3 egoRight   = debugVehicle.transform.right;
 
-        // Draw zone boundaries as lines in ego space
         DrawZoneBoundaries(debugVehicle, map, egoPos, egoForward, egoRight);
-
-        // Draw occupied cells
         DrawOccupiedCells(map, egoPos);
     }
 
@@ -189,22 +190,17 @@ public class WorldPerception : MonoBehaviour
     {
         float lw = map.LaneAndHalf;
 
-        // Same lane forward zones
         DrawLonLine(egoPos, fwd, right, map.FrontClose,  lw, new Color(0f, 1f, 0f, 0.3f));
         DrawLonLine(egoPos, fwd, right, map.FrontMid,    lw, new Color(0f, 0.7f, 0f, 0.2f));
         DrawLonLine(egoPos, fwd, right, map.FrontFar,    lw, new Color(0f, 0.4f, 0f, 0.15f));
+        DrawLonLine(egoPos, fwd, right, -map.RearClose,  lw, new Color(1f, 0.5f, 0f, 0.3f));
+        DrawLonLine(egoPos, fwd, right, -map.RearFar,    lw, new Color(1f, 0.3f, 0f, 0.2f));
 
-        // Rear zones
-        DrawLonLine(egoPos, fwd, right, -map.RearClose, lw, new Color(1f, 0.5f, 0f, 0.3f));
-        DrawLonLine(egoPos, fwd, right, -map.RearFar,   lw, new Color(1f, 0.3f, 0f, 0.2f));
-
-        // Lateral bands
         DrawLatLine(egoPos, fwd, right,  map.HalfLane,    map.FrontFar, new Color(0.5f, 0.5f, 1f, 0.3f));
         DrawLatLine(egoPos, fwd, right, -map.HalfLane,    map.FrontFar, new Color(0.5f, 0.5f, 1f, 0.3f));
         DrawLatLine(egoPos, fwd, right,  map.LaneAndHalf, map.FrontFar, new Color(0.3f, 0.3f, 0.8f, 0.2f));
         DrawLatLine(egoPos, fwd, right, -map.LaneAndHalf, map.FrontFar, new Color(0.3f, 0.3f, 0.8f, 0.2f));
 
-        // Crossing radius
         Gizmos.color = new Color(1f, 0f, 0f, 0.15f);
         Gizmos.DrawWireSphere(egoPos, map.CrossRadius);
     }
@@ -227,21 +223,20 @@ public class WorldPerception : MonoBehaviour
 
     void DrawOccupiedCells(VehicleMap map, Vector3 egoPos)
     {
-        // Colour per zone type
         Color[] zoneColors = new Color[]
         {
-            new Color(1f, 0f, 0f, 0.9f),    // FrontClose  — red, danger
-            new Color(1f, 0.5f, 0f, 0.8f),  // FrontMid    — orange
-            new Color(1f, 1f, 0f, 0.6f),    // FrontFar    — yellow
-            new Color(1f, 0.3f, 0.3f, 0.8f),// RearClose   — pink
-            new Color(0.8f, 0.4f, 0.4f, 0.6f),// RearFar   — light red
-            new Color(0f, 0.8f, 1f, 0.9f),  // FrontLeft   — cyan
-            new Color(0f, 0.5f, 1f, 0.9f),  // BesideLeft  — blue
-            new Color(0f, 0.3f, 0.8f, 0.7f),// RearLeft    — dark blue
-            new Color(0f, 1f, 0.5f, 0.9f),  // FrontRight  — green-cyan
-            new Color(0f, 0.8f, 0.3f, 0.9f),// BesideRight — green
-            new Color(0f, 0.6f, 0.2f, 0.7f),// RearRight   — dark green
-            new Color(1f, 0f, 1f, 0.9f),    // Crossing    — magenta
+            new Color(1f, 0f, 0f, 0.9f),
+            new Color(1f, 0.5f, 0f, 0.8f),
+            new Color(1f, 1f, 0f, 0.6f),
+            new Color(1f, 0.3f, 0.3f, 0.8f),
+            new Color(0.8f, 0.4f, 0.4f, 0.6f),
+            new Color(0f, 0.8f, 1f, 0.9f),
+            new Color(0f, 0.5f, 1f, 0.9f),
+            new Color(0f, 0.3f, 0.8f, 0.7f),
+            new Color(0f, 1f, 0.5f, 0.9f),
+            new Color(0f, 0.8f, 0.3f, 0.9f),
+            new Color(0f, 0.6f, 0.2f, 0.7f),
+            new Color(1f, 0f, 1f, 0.9f),
         };
 
         for (int i = 0; i < (int)MapZone.Count; i++)
@@ -251,15 +246,12 @@ public class WorldPerception : MonoBehaviour
 
             Vector3 vPos = cell.vehicle.transform.position + Vector3.up * 0.5f;
 
-            // Draw sphere on the detected vehicle
             Gizmos.color = zoneColors[i];
             Gizmos.DrawSphere(vPos, 0.8f);
 
-            // Draw line from ego to detected vehicle
             Gizmos.color = new Color(zoneColors[i].r, zoneColors[i].g, zoneColors[i].b, 0.4f);
             Gizmos.DrawLine(egoPos, vPos);
 
-            // Label with zone name and distance
             UnityEditor.Handles.Label(vPos + Vector3.up * 1.2f,
                 $"{(MapZone)i}\n{cell.distance:F1}m {cell.relSpeed:F1}m/s");
         }

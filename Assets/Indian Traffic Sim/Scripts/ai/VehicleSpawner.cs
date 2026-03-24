@@ -2,19 +2,24 @@ using System.Collections.Generic;
 using UnityEngine;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VehicleSpawner — vehicle instantiation, driver profile randomisation.
+// VehicleSpawner — vehicle instantiation, type distribution, driver profiles.
 //
 // Spawn lane discovery: driven by LaneManager.roads + TrafficRoadNode.NodeType.
 //   No manual spawnRoads list needed.
 //   At Start(), walks every road registered in LaneManager. For each road,
 //   finds which endpoint is NodeType.End. Forward lanes whose waypoints[0]
-//   is closest to that End node are the spawn lanes. Works regardless of
-//   whether startNode or endNode is the End node.
+//   is closest to that End node are the spawn lanes.
 //
-// Destination pool: same walk — the End node of every road that is NOT
-//   the spawn lane's road is a valid destination.
+// Vehicle type system:
+//   VehicleTypeDistribution picks a VehicleType each spawn.
+//   VehicleProfileFactory builds the full profile for that type.
+//   BuildConfigForType() applies personality variance on top of the profile.
+//   Narrow lanes reject vehicles too wide to fit (buses can't spawn in bike lanes).
 //
-// Talks to: LaneManager (road list), TrafficVehicle, TrafficSignal, TrafficRoadNode
+// Destination pool: End node of every road that is NOT the spawn lane's road.
+//
+// Talks to: LaneManager, TrafficVehicle, TrafficSignal, TrafficRoadNode,
+//           VehicleProfile, VehicleTypeDistribution
 // ─────────────────────────────────────────────────────────────────────────────
 
 [System.Serializable]
@@ -66,9 +71,14 @@ public class VehicleSpawner : MonoBehaviour
     public LaneManager laneManager;
     public List<TrafficSignal> trafficSignals = new List<TrafficSignal>();
 
-    [Header("Vehicle Types")]
+    [Header("Vehicle Types — NEW")]
+    [Tooltip("Type distribution and per-type prefab pools. " +
+             "Default weights reflect Indian urban traffic composition.")]
+    public VehicleTypeDistribution typeDistribution = new VehicleTypeDistribution();
+
+    [Header("Vehicle Types — Legacy (used when typeDistribution prefab pools are empty)")]
     public GameObject[] vehiclePrefabs;
-    [Tooltip("Spawn probability weight for each prefab")]
+    [Tooltip("Spawn probability weight for each legacy prefab")]
     public float[] vehicleWeights;
 
     [Header("Traffic Limits")]
@@ -87,7 +97,7 @@ public class VehicleSpawner : MonoBehaviour
     public SpeedDistribution         speedDistribution     = new SpeedDistribution();
     public BehaviourDistribution     behaviourDistribution = new BehaviourDistribution();
 
-    [Header("Vehicle Physics")]
+    [Header("Vehicle Physics — Legacy fallback")]
     public float vehicleLength        = 4.5f;
     public float stopLineDistanceBase = 14f;
 
@@ -95,11 +105,8 @@ public class VehicleSpawner : MonoBehaviour
     private Dictionary<TrafficLane, int>            laneOccupancy = new Dictionary<TrafficLane, int>();
     private Dictionary<TrafficLane, TrafficVehicle> lastSpawned   = new Dictionary<TrafficLane, TrafficVehicle>();
 
-    // Spawn lanes — forward lanes whose waypoints[0] sits at a RoadEnd node
-    private List<TrafficLane> spawnLanes = new List<TrafficLane>();
-
-    // Destination nodes — RoadEnd nodes, one per road, used by PickDestinationNode
-    private List<TrafficRoadNode> allDestinationNodes = new List<TrafficRoadNode>();
+    private List<TrafficLane>      spawnLanes           = new List<TrafficLane>();
+    private List<TrafficRoadNode>  allDestinationNodes  = new List<TrafficRoadNode>();
 
     // ─────────────────────────────────────────────────────────────────────
     // Lifecycle
@@ -120,6 +127,7 @@ public class VehicleSpawner : MonoBehaviour
             trafficSignals = new List<TrafficSignal>(FindObjectsOfType<TrafficSignal>());
 
         BuildSpawnAndDestinationLists();
+        typeDistribution.Validate();
     }
 
     void Update()
@@ -132,7 +140,7 @@ public class VehicleSpawner : MonoBehaviour
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Spawn + destination discovery — driven by LaneManager.roads
+    // Spawn + destination discovery
     // ─────────────────────────────────────────────────────────────────────
 
     void BuildSpawnAndDestinationLists()
@@ -153,28 +161,21 @@ public class VehicleSpawner : MonoBehaviour
         {
             if (road == null) continue;
 
-            // Find which endpoint of this road is the RoadEnd node
             TrafficRoadNode endNode = GetRoadEndNode(road);
-            if (endNode == null) continue; // road has no End-type node — skip
+            if (endNode == null) continue;
 
-            // This End node is a valid destination for vehicles coming from other roads
             allDestinationNodes.Add(endNode);
 
-            // Find forward lanes whose waypoints[0] is the end closer to the RoadEnd node.
-            // Instead of a fixed distance threshold (which fails for wide/offset roads),
-            // compare both ends of the lane path — whichever end is closer to the End node
-            // determines direction. If waypoints[0] is closer → lane starts at End node → spawn lane.
             foreach (var lane in road.lanes)
             {
                 if (lane == null) continue;
                 if (lane.path == null || lane.path.waypoints == null ||
                     lane.path.waypoints.Count < 2) continue;
 
-                Vector3 wp0   = lane.path.waypoints[0].position;
+                Vector3 wp0    = lane.path.waypoints[0].position;
                 Vector3 wpLast = lane.path.waypoints[lane.path.waypoints.Count - 1].position;
                 Vector3 endPos = endNode.transform.position;
 
-                // Spawn lane = waypoints[0] is closer to the End node than waypoints[last]
                 if (Vector3.Distance(wp0, endPos) < Vector3.Distance(wpLast, endPos))
                 {
                     spawnLanes.Add(lane);
@@ -192,10 +193,6 @@ public class VehicleSpawner : MonoBehaviour
                       $"{allDestinationNodes.Count} destination node(s).");
     }
 
-    /// <summary>
-    /// Returns the TrafficRoadNode with NodeType.End on this road, or null if none.
-    /// Works regardless of whether it is startNode or endNode.
-    /// </summary>
     TrafficRoadNode GetRoadEndNode(TrafficRoad road)
     {
         if (road.startNode != null && road.startNode.nodeType == TrafficRoadNode.NodeType.End)
@@ -219,7 +216,6 @@ public class VehicleSpawner : MonoBehaviour
         foreach (var node in allDestinationNodes)
         {
             if (node == null) continue;
-            // Exclude the End node of the spawn road — vehicle is already there
             if (spawnRoad != null &&
                 (node == spawnRoad.startNode || node == spawnRoad.endNode)) continue;
             candidates.Add(node);
@@ -235,11 +231,16 @@ public class VehicleSpawner : MonoBehaviour
     void TrySpawnVehicle()
     {
         if (spawnLanes.Count == 0) return;
-        var lane = spawnLanes[Random.Range(0, spawnLanes.Count)];
-        if (!laneOccupancy.ContainsKey(lane)) return;
-        if (laneOccupancy[lane] >= maxVehiclesPerLane) return;
-        if (!IsSpawnPointClear(lane)) return;
-        SpawnVehicle(lane);
+
+        // Pick vehicle type first — lane selection depends on vehicle width
+        VehicleType    type    = typeDistribution.PickType();
+        VehicleProfile profile = VehicleProfileFactory.Create(type);
+
+        // Find a spawn lane this vehicle fits in
+        TrafficLane lane = PickSpawnLane(profile);
+        if (lane == null) return;
+
+        SpawnVehicle(lane, type, profile);
     }
 
     public void ForceSpawn(int count)
@@ -248,12 +249,56 @@ public class VehicleSpawner : MonoBehaviour
         for (int k = 0; k < count; k++)
         {
             if (TotalVehicles() >= maxVehiclesTotal) return;
-            var lane = spawnLanes[k % spawnLanes.Count];
-            if (!laneOccupancy.ContainsKey(lane)) continue;
-            if (laneOccupancy[lane] >= maxVehiclesPerLane) continue;
-            if (!IsSpawnPointClear(lane)) continue;
-            SpawnVehicle(lane);
+
+            VehicleType    type    = typeDistribution.PickType();
+            VehicleProfile profile = VehicleProfileFactory.Create(type);
+            TrafficLane    lane    = PickSpawnLane(profile);
+            if (lane == null) continue;
+
+            SpawnVehicle(lane, type, profile);
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Lane selection — filters by vehicle width
+    // ─────────────────────────────────────────────────────────────────────
+
+    TrafficLane PickSpawnLane(VehicleProfile profile)
+    {
+        // Shuffle so we don't always pick index 0
+        var candidates = new List<TrafficLane>(spawnLanes);
+        for (int i = candidates.Count - 1; i > 0; i--)
+        {
+            int j   = Random.Range(0, i + 1);
+            var tmp = candidates[i]; candidates[i] = candidates[j]; candidates[j] = tmp;
+        }
+
+        // Minimum lane width = vehicle width + 0.3m clearance each side
+        float minLaneWidth = profile.Physical.width + 0.3f;
+
+        foreach (var lane in candidates)
+        {
+            if (lane == null || lane.path == null) continue;
+
+            // Check lane width
+            float laneW = lane.road != null ? lane.road.laneWidth : 3.5f;
+            if (laneW < minLaneWidth) continue;
+
+            // Check occupancy cap
+            laneOccupancy.TryGetValue(lane, out int occ);
+            if (occ >= maxVehiclesPerLane) continue;
+
+            // Check last-spawned clearance
+            if (lastSpawned.TryGetValue(lane, out var last) && last != null)
+            {
+                float dist = Vector3.Distance(
+                    lane.path.waypoints[0].position, last.transform.position);
+                if (dist < spawnClearDistance) continue;
+            }
+
+            return lane;
+        }
+        return null;
     }
 
     bool IsSpawnPointClear(TrafficLane lane)
@@ -265,9 +310,15 @@ public class VehicleSpawner : MonoBehaviour
                                 lane.path.waypoints[0].position) >= spawnClearDistance;
     }
 
-    void SpawnVehicle(TrafficLane lane)
+    // ─────────────────────────────────────────────────────────────────────
+    // Instantiation
+    // ─────────────────────────────────────────────────────────────────────
+
+    void SpawnVehicle(TrafficLane lane, VehicleType type, VehicleProfile profile)
     {
-        var prefab = ChooseVehiclePrefab();
+        // Pick prefab from type pool, fallback to legacy pool
+        GameObject prefab = typeDistribution.PickPrefab(type);
+        if (prefab == null) prefab = ChooseLegacyPrefab();
         if (prefab == null) return;
 
         Vector3    spawnPos = lane.path.waypoints[0].position;
@@ -287,7 +338,10 @@ public class VehicleSpawner : MonoBehaviour
             return;
         }
 
-        vehicle.Initialize(BuildConfig(lane));
+        var driverProfile = ChooseProfile();
+        var cfg           = BuildConfigForType(type, profile, driverProfile, lane);
+
+        vehicle.Initialize(cfg);
         vehicle.context.DestNode = PickDestinationNode(lane);
         vehicle.currentSignal    = FindSignalForLane(lane);
         vehicle.laneManager      = laneManager;
@@ -298,6 +352,56 @@ public class VehicleSpawner : MonoBehaviour
         laneOccupancy[lane]++;
         lastSpawned[lane] = vehicle;
         vehicleGO.AddComponent<SpawnTracker>().Init(this, lane);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Config builder — type-aware
+    // ─────────────────────────────────────────────────────────────────────
+
+    TrafficVehicle.VehicleConfig BuildConfigForType(
+        VehicleType type,
+        VehicleProfile profile,
+        TrafficVehicle.DriverProfile driverProfile,
+        TrafficLane lane)
+    {
+        // Speed variance: driver personality shifts position within the type envelope
+        float speedVariance = driverProfile == TrafficVehicle.DriverProfile.Aggressive
+            ? Random.Range(1.05f, 1.20f)
+            : driverProfile == TrafficVehicle.DriverProfile.Cautious
+            ? Random.Range(0.70f, 0.88f)
+            : Random.Range(0.88f, 1.02f);
+
+        float desiredSpeedMs = profile.Agility.desiredSpeedMs * speedVariance;
+
+        // Clamp to road speed limit if available
+        if (lane?.road != null && lane.road.speedLimit > 0f)
+        {
+            float limitMs = lane.road.speedLimit / 3.6f;
+            desiredSpeedMs = Mathf.Min(desiredSpeedMs, limitMs * speedVariance);
+        }
+
+        // Headway variance on top of type social baseline
+        float headwayVariance = driverProfile == TrafficVehicle.DriverProfile.Aggressive
+            ? Random.Range(0.70f, 0.90f)
+            : driverProfile == TrafficVehicle.DriverProfile.Cautious
+            ? Random.Range(1.20f, 1.50f)
+            : Random.Range(0.90f, 1.10f);
+
+        return new TrafficVehicle.VehicleConfig
+        {
+            profile          = driverProfile,
+            vehicleProfile   = profile,
+            maxSpeedKph      = profile.Agility.maxSpeedKph,
+            desiredSpeedMs   = Mathf.Min(desiredSpeedMs, profile.Agility.maxSpeedKph / 3.6f),
+            acceleration     = profile.Agility.acceleration * Random.Range(0.90f, 1.15f),
+            braking          = profile.Agility.braking      * Random.Range(0.90f, 1.10f),
+            timeHeadway      = profile.Social.timeHeadway   * headwayVariance,
+            minimumGap       = profile.Social.minimumGap,
+            vehicleLength    = profile.Physical.length,
+            stopLineDistance = stopLineDistanceBase,
+            lateralVariance  = profile.Agility.maxLateralOffsetM * profile.Agility.lateralAgility,
+            destNode         = null   // assigned after Initialize()
+        };
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -318,74 +422,24 @@ public class VehicleSpawner : MonoBehaviour
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Config builder
+    // Profile selection
     // ─────────────────────────────────────────────────────────────────────
-
-    TrafficVehicle.VehicleConfig BuildConfig(TrafficLane lane)
-    {
-        var profile = ChooseProfile();
-        var b = behaviourDistribution;
-        var s = speedDistribution;
-
-        float baseAccel, baseBraking, baseHeadway, minGap, baseMaxSpeed;
-
-        switch (profile)
-        {
-            case TrafficVehicle.DriverProfile.Cautious:
-                baseMaxSpeed = Random.Range(s.cautiousMin,   s.cautiousMax);
-                baseAccel    = b.cautiousAccel;    baseBraking = b.cautiousbraking;
-                baseHeadway  = b.cautiousHeadway;  minGap      = b.cautiousGap;   break;
-            case TrafficVehicle.DriverProfile.Aggressive:
-                baseMaxSpeed = Random.Range(s.aggressiveMin, s.aggressiveMax);
-                baseAccel    = b.aggressiveAccel;  baseBraking = b.aggressiveBraking;
-                baseHeadway  = b.aggressiveHeadway;minGap      = b.aggressiveGap; break;
-            default:
-                baseMaxSpeed = Random.Range(s.normalMin,     s.normalMax);
-                baseAccel    = b.normalAccel;      baseBraking = b.normalBraking;
-                baseHeadway  = b.normalHeadway;    minGap      = b.normalGap;     break;
-        }
-
-        float accel   = Mathf.Max(baseAccel   * Random.Range(1f - b.accelVariance,   1f + b.accelVariance), 0.5f);
-        float braking = Mathf.Max(baseBraking * Random.Range(1f - b.brakingVariance, 1f + b.brakingVariance), 2f);
-        float headway = Mathf.Max(baseHeadway + Random.Range(-b.headwayVariance,      b.headwayVariance), 0.4f);
-
-        float desiredSpeed = baseMaxSpeed * Random.Range(0.85f, 1.0f);
-        if (lane?.road != null && lane.road.speedLimit > 0f)
-        {
-            float limitMs  = lane.road.speedLimit / 3.6f;
-            float variance = profile == TrafficVehicle.DriverProfile.Aggressive ? Random.Range(1.0f, 1.2f)
-                           : profile == TrafficVehicle.DriverProfile.Normal      ? Random.Range(0.9f, 1.05f)
-                           :                                                        Random.Range(0.75f, 0.92f);
-            desiredSpeed = Mathf.Min(baseMaxSpeed, limitMs * variance);
-        }
-
-        float maxSpeedKph = Mathf.Min(baseMaxSpeed * 3.6f, 70f);
-
-        return new TrafficVehicle.VehicleConfig
-        {
-            profile          = profile,
-            maxSpeedKph      = maxSpeedKph,
-            desiredSpeedMs   = Mathf.Min(desiredSpeed, maxSpeedKph / 3.6f),
-            acceleration     = accel,
-            braking          = braking,
-            timeHeadway      = headway,
-            minimumGap       = minGap,
-            vehicleLength    = vehicleLength,
-            stopLineDistance = stopLineDistanceBase,
-        };
-    }
 
     TrafficVehicle.DriverProfile ChooseProfile()
     {
-        var d = profileDistribution;
+        var d     = profileDistribution;
         float total = d.cautiousWeight + d.normalWeight + d.aggressiveWeight;
-        float r = Random.value * total;
+        float r     = Random.value * total;
         if (r < d.cautiousWeight)                  return TrafficVehicle.DriverProfile.Cautious;
         if (r < d.cautiousWeight + d.normalWeight) return TrafficVehicle.DriverProfile.Normal;
         return TrafficVehicle.DriverProfile.Aggressive;
     }
 
-    GameObject ChooseVehiclePrefab()
+    // ─────────────────────────────────────────────────────────────────────
+    // Legacy prefab fallback
+    // ─────────────────────────────────────────────────────────────────────
+
+    GameObject ChooseLegacyPrefab()
     {
         if (vehiclePrefabs == null || vehiclePrefabs.Length == 0) return null;
         if (vehicleWeights == null || vehicleWeights.Length != vehiclePrefabs.Length)
@@ -416,25 +470,18 @@ public class VehicleSpawner : MonoBehaviour
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Gizmos — always visible, shows spawn points before Play
+    // Gizmos
     // ─────────────────────────────────────────────────────────────────────
-    //   Cyan sphere = spawn point (waypoints[0] of each spawn lane)
-    //   Cyan arrow  = spawn direction
-    //   Cyan ring   = spawnClearDistance safety radius
-    //   Red sphere  = road has a RoadEnd node but no matching spawn lanes
 
     void OnDrawGizmos()
     {
-        // Draw from spawnLanes if already built (Play mode or after Start)
         if (spawnLanes != null && spawnLanes.Count > 0)
         {
             DrawSpawnLaneGizmos(spawnLanes);
             return;
         }
 
-        // Editor mode — derive spawn lanes on the fly from LaneManager
-        if (laneManager == null) return;
-        if (laneManager.roads == null) return;
+        if (laneManager == null || laneManager.roads == null) return;
 
         var preview = new List<TrafficLane>();
         foreach (var road in laneManager.roads)
@@ -443,7 +490,6 @@ public class VehicleSpawner : MonoBehaviour
             var endNode = GetRoadEndNode(road);
             if (endNode == null)
             {
-                // No End node — draw grey marker on road
                 Gizmos.color = new Color(0.5f, 0.5f, 0.5f, 0.5f);
                 Gizmos.DrawWireSphere(road.transform.position + Vector3.up, 0.8f);
                 continue;
@@ -467,7 +513,6 @@ public class VehicleSpawner : MonoBehaviour
                 }
             }
 
-            // Road has End node but no lanes generated yet
             if (!foundSpawnLane && road.lanes.Count == 0)
             {
                 Gizmos.color = Color.red;
@@ -496,11 +541,9 @@ public class VehicleSpawner : MonoBehaviour
 
             Vector3 origin = spawnPos + Vector3.up * 0.3f;
 
-            // Sphere
             Gizmos.color = new Color(0f, 0.9f, 1f, 0.9f);
             Gizmos.DrawSphere(origin, 0.5f);
 
-            // Arrow
             Vector3 tip   = origin + spawnDir * 3f;
             Vector3 right = Vector3.Cross(spawnDir, Vector3.up).normalized;
             Gizmos.color  = new Color(0f, 0.9f, 1f, 0.7f);
@@ -508,7 +551,6 @@ public class VehicleSpawner : MonoBehaviour
             Gizmos.DrawLine(tip, tip - spawnDir * 0.8f + right * 0.4f);
             Gizmos.DrawLine(tip, tip - spawnDir * 0.8f - right * 0.4f);
 
-            // Clear radius ring
             Gizmos.color = new Color(0f, 0.9f, 1f, 0.1f);
             Gizmos.DrawWireSphere(origin, spawnClearDistance);
 

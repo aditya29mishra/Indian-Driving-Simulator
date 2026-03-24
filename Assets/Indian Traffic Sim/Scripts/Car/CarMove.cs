@@ -148,6 +148,13 @@ public class CarMove : MonoBehaviour
 
     /// <summary>Sets the top speed of the car in km/h.</summary>
     /// <param name="kph">The top speed in km/h.</param>
+    public void SetMaxSteerAngle(float degrees)
+    {
+        m_MaximumSteerAngle = Mathf.Clamp(degrees, 10f, 60f);
+    }
+
+    /// <summary>Sets the top speed of the car in km/h.</summary>
+    /// <param name="kph">The top speed in km/h.</param>
     public void SetTopSpeed(float kph)
     {
         m_Topspeed = kph;
